@@ -263,6 +263,111 @@ protected:
         ROS_WARN("VisPRM: Max iterations reached without solution.");
         return false;
     }
+
+public:
+    /**
+     * @brief Grows the roadmap until every target is seen by enough reachable vertices.
+     *
+     * Begins by asking what the roadmap ALREADY answers: a roadmap that survived
+     * earlier queries may hold vertices that see these targets, and finding them costs
+     * a scan rather than a search. Then alternates between sampling a goal for a target
+     * still short of its coverage and expanding the roadmap, until every target is
+     * satisfied or the run is out of time.
+     *
+     * The graph is not reset. One planner per region is the contract, so its roadmap is
+     * that region's roadmap, and reusing it across queries is what keeps the amortized
+     * cost low.
+     */
+    bool planCoverage() override {
+        if (!beginCoverageRun()) return false;
+
+        // Restricted to the arm, VisualIK cannot move the base, so a snapped
+        // configuration inherits the base of the vertex it snapped from. Restored when
+        // this scope ends, whichever way it ends.
+        IKGroupGuard ik_guard(ctx_->getVisualIK(),
+                              locality_.enabled ? locality_.ik_group : std::string());
+
+        root_id_ = addState(start_joint_values_);
+        checked_vertices_.clear();
+
+        size_t start_num_neighbors = (graph_.getNumVertices() > 100) ? prm_params_.num_neighbors
+                                                                    : prm_params_.num_neighbors * 3;
+        bool start_cfg_connected =
+            (connectToGraph(start_joint_values_, start_num_neighbors, root_id_) != -1);
+
+        ROS_INFO("VisPRM coverage: start configuration %s to roadmap of %lu vertices.",
+                 start_cfg_connected ? "CONNECTED" : "NOT connected", graph_.getNumVertices());
+
+        ros::WallTime start_time = ros::WallTime::now();
+
+        // Scan what the roadmap already holds. The bound is read once, so vertices the
+        // scan itself adds by snapping are not rescanned -- they were tested as they
+        // were created.
+        const size_t scanned_vertices = graph_.getNumVertices();
+        for (size_t v = 0; v < scanned_vertices; ++v) {
+            recordVisibleTargets(v, graph_.getVertexConfig(v), graph_.getVertexPose(v),
+                                 snap_fov_on_scan_);
+        }
+
+        const int max_iterations = 1000;
+        for (int iter = 0; iter < max_iterations; ++iter) {
+            if (coverageComplete()) break;
+
+            double elapsed = (ros::WallTime::now() - start_time).toSec();
+            if (elapsed > time_cap_) {
+                ROS_WARN("VisPRM coverage: time cap of %d s reached (elapsed: %.2f s).",
+                         time_cap_, elapsed);
+                break;
+            }
+
+            // --- Sample a goal for one target still short of its coverage ---
+            // max_goals caps how many goal configurations a target may HOLD, not how
+            // many times one is attempted: sampling goals is expensive, and past a
+            // handful of them the useful work is connecting the ones already found
+            // rather than finding more. Counted per target, since one shared budget
+            // would be spent by whichever targets came up first.
+            int t = pickUnsatisfiedTarget();
+            if (t >= 0 && use_visibility_integrity_ &&
+                static_cast<int>(coverage_.goals[t].size()) < prm_params_.max_goals) {
+
+                std::vector<double> q_goal;
+                if (sampleVisibilityGoal(targets_[t], q_goal) && inLocality(q_goal)) {
+                    // Added whether or not it connects to anything yet: an isolated goal
+                    // is a candidate the coverage count simply does not credit until the
+                    // roadmap grows around it, which is what deficits are recomputed for.
+                    VertexDesc g = addState(q_goal);
+                    connectToGraph(q_goal, prm_params_.num_neighbors, g);
+                    recordVisibleTargets(g, q_goal, graph_.getVertexPose(g),
+                                         snap_fov_on_insert_);
+                }
+            }
+
+            // --- Expand the roadmap ---
+            if (graph_.getNumVertices() < static_cast<size_t>(prm_params_.max_size)) {
+                for (int i = 0; i < prm_params_.num_samples; ++i) {
+                    std::vector<double> q_rand = sampleLocalUniform();
+                    if (!ctx_->validity_checker_->isValid(q_rand)) continue;
+
+                    VertexDesc v_id = addState(q_rand);
+                    connectToGraph(q_rand, prm_params_.num_neighbors, v_id);
+                    recordVisibleTargets(v_id, q_rand, graph_.getVertexPose(v_id),
+                                         snap_fov_on_insert_);
+                }
+            }
+
+            if (!start_cfg_connected) {
+                std::vector<double> q_start = graph_.getVertexConfig(root_id_);
+                if (connectToGraph(q_start, prm_params_.num_neighbors, root_id_) != -1) {
+                    ROS_WARN("VisPRM coverage: start configuration is now connected.");
+                    start_cfg_connected = true;
+                }
+            }
+        }
+
+        coverageComplete();
+        logCoverageSummary("VisPRM coverage", start_time);
+        return coverage_.complete;
+    }
 };
 
 } // namespace visual_planner

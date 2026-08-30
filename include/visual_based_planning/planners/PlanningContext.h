@@ -6,6 +6,7 @@
 #include <memory>
 #include <algorithm>
 #include <string>
+#include <stdexcept>
 
 // ROS
 #include <ros/ros.h>
@@ -323,6 +324,30 @@ public:
     }
 
     /**
+     * @brief The mobile base's (x, y) for a configuration of the planning group.
+     *
+     * Both target robots -- the simulated mobile UR5, whose base is two prismatic
+     * joints, and the Husky + UR5 -- carry the base translation in the first two
+     * variables of the planning group, so it is read directly rather than resolved by
+     * joint name.
+     *
+     * This is the one place that assumption lives. Should the real Husky report its
+     * base from localization rather than from a joint value, this method becomes the
+     * service call and no caller changes.
+     *
+     * Throws on a configuration too short to hold a base position: that is a
+     * programming error, and answering (0,0) would silently place the base at the
+     * centre of the environment -- inside the locality disk in most scenes, so the
+     * constraint would look enforced while enforcing nothing.
+     */
+    Eigen::Vector2d basePosition(const std::vector<double>& q) const {
+        if (q.size() < 2) {
+            throw std::runtime_error("PlanningContext::basePosition: configuration has no base variables.");
+        }
+        return Eigen::Vector2d(q[0], q[1]);
+    }
+
+    /**
      * @brief Samples a workspace point that sees `target`, using whichever visibility
      *        structure is active.
      */
@@ -331,6 +356,24 @@ public:
             return vis_roadmap_->SampleFromVisibilityRegion(target, sample_pos, visibility_threshold_);
         }
         return vis_integrity_->SampleFromVisibilityRegion(target, sample_pos, visibility_threshold_);
+    }
+
+    /**
+     * @brief Asks the VI-tree which regions see enough of each of several targets.
+     *
+     * Only the VI-tree answers this; the VIR roadmap has no multi-target query. A
+     * caller that gets false has no region information and must not read that as "no
+     * region sees these targets".
+     *
+     * @return false when the VI-tree is not the active structure, or was never built.
+     */
+    bool queryMultiTarget(const std::vector<Ball>& targets, MultiTargetQueryResult& out,
+                          double threshold) {
+        if (use_visibility_roadmap_ || !use_visibility_structure_) return false;
+        if (!vis_integrity_ || !vis_integrity_->isBuilt()) return false;
+
+        vis_integrity_->query(targets, out, threshold);
+        return true;
     }
 };
 

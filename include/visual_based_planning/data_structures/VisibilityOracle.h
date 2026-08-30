@@ -126,11 +126,60 @@ public:
 
 
 
+    /**
+     * @brief Conservative test for a ball lying ENTIRELY outside the beam.
+     *
+     * Compares the ball against the infinite cone and the range limit in closed form:
+     * no sampling, no ray casting. True means no point of the ball can be lit, so the
+     * caller may report zero visibility without testing further. A ball that is only
+     * PARTIALLY inside the beam is never rejected, nor is one the beam reaches only
+     * with its tip -- false is the answer whenever any doubt remains, and the full
+     * check then runs as before.
+     *
+     * Exists because the multi-target coverage queries test every graph node against
+     * every uncovered target, multiplying the number of visibility calls by the size
+     * of the target set. Each full call costs num_samples_ ray casts against every
+     * obstacle, while the overwhelming majority of (node, target) pairs are nowhere
+     * near one another.
+     *
+     * Geometry: for a sensor outside the ball, the directions to the points of the
+     * ball fill exactly a cone of half-angle asin(r/d) about the direction to its
+     * centre -- the tangent cone. The beam is a cone of half-angle beam_angle about
+     * the local +Z axis. Two such cones are disjoint precisely when the angle between
+     * their axes exceeds the sum of their half-angles, which is the test below. When
+     * the sensor lies inside the ball there is no tangent cone and nothing is
+     * rejected. Where the test fires, the sampling loop below would have found none of
+     * its samples in the field of view and returned 0.0, so results are unchanged.
+     */
+    bool ballOutsideBeam(const Eigen::Isometry3d& sensor_pose, const Eigen::Vector3d& center, double radius) {
+        const Eigen::Vector3d local_center = sensor_pose.inverse() * center;
+        const double d = local_center.norm();
+
+        // Out of range: every point of the ball is at least (d - radius) away.
+        if (d - radius > tool_params_.beam_length) return true;
+
+        // Sensor inside the ball, or on its centre: no tangent cone to separate.
+        if (d <= radius || d < 1e-9) return false;
+
+        const double angle_to_center = std::acos(std::max(-1.0, std::min(1.0, local_center.z() / d)));
+        const double angular_radius  = std::asin(std::min(1.0, radius / d));
+
+        return (angle_to_center - angular_radius) > tool_params_.beam_angle;
+    }
+
+    bool ballOutsideBeam(const Eigen::Isometry3d& sensor_pose, const Ball& b) {
+        return ballOutsideBeam(sensor_pose, b.center, b.radius);
+    }
+
 /**
      * @brief Checks what fraction of a ball is illuminated by the beam (Pose Variant).
      * optimized for GPU batching.
      */
     double checkBallBeamVisibility(const Eigen::Isometry3d& sensor_pose, const Eigen::Vector3d center, double radius) {
+        // A ball that misses the beam entirely would sample num_samples_ points only to
+        // find none of them in the field of view.
+        if (ballOutsideBeam(sensor_pose, center, radius)) return 0.0;
+
         // 1. Generate all samples first
         std::vector<Eigen::Vector3d> samples;
         samples.reserve(num_samples_);

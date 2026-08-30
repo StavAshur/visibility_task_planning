@@ -426,6 +426,10 @@ public:
         return true;
     }
 
+    /// Whether build() has produced a tree. Every query answers emptily until it has,
+    /// which a caller cannot otherwise distinguish from "nothing sees the target".
+    bool isBuilt() const { return root_ != nullptr; }
+
 
 private:
     std::shared_ptr<VisibilityOracle> vis_oracle_;

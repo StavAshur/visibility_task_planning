@@ -35,7 +35,7 @@ struct TargetProblem {
 struct ExperimentConfig {
     std::string name;
     std::string planner_mode;        
-    bool use_visual_ik;
+    bool snap_fov_on_insert;
     bool use_visibility_integrity;
     bool use_visibility_roadmap;
 };
@@ -100,7 +100,10 @@ public:
             ROS_INFO("Starting Configuration: %s", cfg.name.c_str());
             
             nh_.setParam("/planner/mode", cfg.planner_mode);
-            nh_.setParam("/planner/use_visual_ik", cfg.use_visual_ik);
+            nh_.setParam("/planner/snap_fov_on_insert", cfg.snap_fov_on_insert);
+            // No experiment here scans a roadmap for FOV snapping, and pinning it keeps
+            // a run from inheriting whatever the previous one left on the param server.
+            nh_.setParam("/planner/snap_fov_on_scan", false);
             nh_.setParam("/planner/visibility_integrity/enabled", cfg.use_visibility_integrity);
             nh_.setParam("/planner/use_visibility_integrity", cfg.use_visibility_integrity);
             nh_.setParam("/planner/use_visibility_roadmap", cfg.use_visibility_roadmap);

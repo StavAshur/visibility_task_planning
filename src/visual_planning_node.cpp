@@ -2,6 +2,7 @@
 #include <moveit/planning_scene_monitor/planning_scene_monitor.h>
 #include <angles/angles.h>
 #include <stdexcept>
+#include <utility>
 
 // Include your headers
 #include "visual_based_planning/planners/PlannerFactory.h"
@@ -26,7 +27,8 @@ private:
     /// Set when a parameter changed that is baked into the planner object itself
     /// (its type, or a value passed at construction), so it must be rebuilt.
     bool planner_dirty_;
-    bool use_visual_ik_;
+    bool snap_fov_on_insert_;
+    bool snap_fov_on_scan_;
     bool use_visibility_integrity_;
     bool use_visibility_roadmap_;
     bool current_shortcutting_;
@@ -51,7 +53,8 @@ public:
         ctx_ = std::make_shared<visual_planner::PlanningContext>(scene_ptr);
 
         // Initialize current state trackers with defaults (or what was just loaded)
-        use_visual_ik_ = false;
+        snap_fov_on_insert_ = false;
+        snap_fov_on_scan_ = false;
         use_visibility_integrity_ = false;
         use_visibility_roadmap_ = false;
         current_shortcutting_ = true;
@@ -71,7 +74,35 @@ public:
         ROS_WARN("Visual Planning Service Ready");
     }
 
+    /**
+     * @brief Refuses to start when a config still sets a parameter that was renamed.
+     *
+     * A parameter nobody reads is not an error ROS reports: the run would take the new
+     * parameter's default and quietly do the opposite of what the config asked for.
+     * Since use_visual_ik selected the VisRRT variant the paper benchmarks, a run that
+     * silently ignored it would produce numbers for the wrong algorithm.
+     */
+    void rejectRetiredParams() {
+        static const std::pair<const char*, const char*> retired[] = {
+            {"planner/use_visual_ik", "planner/snap_fov_on_insert"},
+        };
+
+        for (const auto& entry : retired) {
+            const std::string private_name(entry.first);
+            const std::string global_name = "/" + private_name;
+
+            if (pnh_.hasParam(private_name) || nh_.hasParam(global_name)) {
+                ROS_FATAL("Parameter '%s' was renamed to '%s' and is no longer read. "
+                          "Update the config rather than letting this run take a default.",
+                          entry.first, entry.second);
+                throw std::runtime_error("retired parameter still set: " + private_name);
+            }
+        }
+    }
+
     void loadStaticConfig() {
+        rejectRetiredParams();
+
         pnh_.param<std::string>("planner/mode", current_mode_, "VisRRT");
 
         double resolution;
@@ -91,9 +122,9 @@ public:
         pnh_.param<double>("planner/visibility_threshold", visibility_threshold, 0.75);
         ctx_->setVisibilityThreshold(visibility_threshold);
 
-        bool use_visual_ik;
-        pnh_.param("planner/use_visual_ik", use_visual_ik_, true);
-        // retained; applied at planner construction
+        // Retained; applied at planner construction.
+        pnh_.param("planner/snap_fov_on_insert", snap_fov_on_insert_, true);
+        pnh_.param("planner/snap_fov_on_scan", snap_fov_on_scan_, false);
 
         std::string group_name;
         // pnh_.param<std::string>("planner/group_name", group_name, "manipulator");
@@ -164,7 +195,8 @@ public:
      */
     bool rebuildPlanner(const planning_scene::PlanningScenePtr& scene, const std::string& mode) {
         visual_planner::PlannerOptions opts;
-        opts.use_visual_ik = use_visual_ik_;
+        opts.snap_fov_on_insert = snap_fov_on_insert_;
+        opts.snap_fov_on_scan = snap_fov_on_scan_;
         opts.use_visibility_integrity = use_visibility_integrity_;
         opts.shortcutting = current_shortcutting_;
         opts.time_cap = time_cap_;
@@ -188,19 +220,30 @@ public:
     void updatePlannerParams() {
         bool changed_this_cycle = false;
 
-        // 1. Visual IK (Global)
-        bool new_vis_ik = false;
-        if (!nh_.getParam("/planner/use_visual_ik", new_vis_ik)) {
-            // If param missing, default to true
-            new_vis_ik = true;
+        // 1. FOV snapping (Global)
+        bool new_snap_insert = true;
+        if (!nh_.getParam("/planner/snap_fov_on_insert", new_snap_insert)) {
+            new_snap_insert = true;
         }
 
-        if (new_vis_ik != use_visual_ik_) {
+        if (new_snap_insert != snap_fov_on_insert_) {
             // Passed at construction, so the planner has to be rebuilt to pick it up.
             planner_dirty_ = true;
-            use_visual_ik_ = new_vis_ik;
+            snap_fov_on_insert_ = new_snap_insert;
             changed_this_cycle = true;
-            ROS_INFO("Param Changed: use_visual_ik -> %s", new_vis_ik ? "TRUE" : "FALSE");
+            ROS_INFO("Param Changed: snap_fov_on_insert -> %s", new_snap_insert ? "TRUE" : "FALSE");
+        }
+
+        bool new_snap_scan = false;
+        if (!nh_.getParam("/planner/snap_fov_on_scan", new_snap_scan)) {
+            new_snap_scan = false;
+        }
+
+        if (new_snap_scan != snap_fov_on_scan_) {
+            planner_->setSnapFovOnScan(new_snap_scan);
+            snap_fov_on_scan_ = new_snap_scan;
+            changed_this_cycle = true;
+            ROS_INFO("Param Changed: snap_fov_on_scan -> %s", new_snap_scan ? "TRUE" : "FALSE");
         }
 
         // 2. Visibility Integrity (Global)

@@ -14,13 +14,15 @@ namespace visual_planner {
 /**
  * @brief Everything a planner needs configured that is not part of the shared context.
  *
- * Grouped into one struct so a caller can describe a planner in a single value and the
- * factory can apply the planner-specific pieces (VisRRT's VisualIK snap) only where
- * they mean something. Without this the caller would have to downcast the returned
- * base pointer to reach those setters.
+ * Grouped into one struct so a caller can describe a planner in a single value, rather
+ * than reaching for a setter per option on a base pointer it would have to downcast.
  */
 struct PlannerOptions {
-    bool use_visual_ik = true;            ///< VisRRT only: attempt the VisualIK snap.
+    /// Snap a vertex being added, whose position sees a target, into one that looks at
+    /// it. VisRRT's plan() and both planners' coverage queries.
+    bool snap_fov_on_insert = true;
+    /// The same while scanning vertices the graph already held (VisPRM coverage only).
+    bool snap_fov_on_scan = false;
     bool use_visibility_integrity = true; ///< Draw goal samples from the visibility structure.
     bool shortcutting = true;
     int time_cap = 120;
@@ -47,7 +49,7 @@ inline std::unique_ptr<VisibilityPlannerBase> createPlanner(
     std::unique_ptr<VisibilityPlannerBase> planner;
 
     if (mode == "VisRRT") {
-        planner.reset(new VisRRTPlanner(ctx, opts.use_visual_ik));
+        planner.reset(new VisRRTPlanner(ctx, opts.snap_fov_on_insert));
     } else if (mode == "VisPRM") {
         planner.reset(new VisPRMPlanner(ctx));
     } else {
@@ -55,6 +57,8 @@ inline std::unique_ptr<VisibilityPlannerBase> createPlanner(
         return nullptr;
     }
 
+    planner->setSnapFovOnInsert(opts.snap_fov_on_insert);
+    planner->setSnapFovOnScan(opts.snap_fov_on_scan);
     planner->setShortcutting(opts.shortcutting);
     planner->setTimeCap(opts.time_cap);
     planner->setRRTParams(opts.rrt);

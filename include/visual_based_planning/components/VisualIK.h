@@ -1,6 +1,8 @@
 #pragma once
 
 #include <vector>
+#include <string>
+#include <stdexcept>
 #include <Eigen/Geometry>
 #include <eigen_conversions/eigen_msg.h>
 #include <moveit/robot_model/robot_model.h>
@@ -39,15 +41,62 @@ public:
      */
     bool solveIK(const Eigen::Isometry3d& pose, const std::vector<double>& seed_joints, std::vector<double>& solution_out) {
         robot_state_->setJointGroupPositions(group_name_, seed_joints);
+        // The pose is given in the model frame, and the solver reaches it through the
+        // link transforms of the seed -- which matters when the IK group is a subgroup
+        // mounted on joints it may not move.
+        robot_state_->update();
         return checkIK(pose, solution_out);
     }
 
     void setGroupName(const std::string& group) {
-        group_name_ = group; 
+        group_name_ = group;
     }
-    
+
     void setEELinkName(const std::string& ee_link) {
         ee_link_name_ = ee_link;
+    }
+
+    /**
+     * @brief Restricts the solver to a SUBGROUP of the configuration's joints.
+     *
+     * Two groups are in play. The state group (setGroupName) says what a configuration
+     * vector means: it is the group every seed is expressed in, the group FK is read
+     * from, and the group solutions are returned in. The IK group says which of those
+     * joints the solver is allowed to move. They are the same group unless this is
+     * called.
+     *
+     * The reason to separate them is the base-locality constraint: with the IK group
+     * set to the arm alone, a solution cannot move the mobile base at all, so it
+     * inherits the base position of its seed and can never leave the disk the seed was
+     * drawn from. The alternative -- solving over the whole robot and rejecting
+     * solutions that left the disk -- gives the solver no incentive to stay inside it,
+     * and its random restarts place the base anywhere in a ten-metre range.
+     *
+     * The joints outside the IK group keep whatever values the seed gave them, so
+     * inputs and outputs are unaffected: still full state-group vectors.
+     *
+     * @param group A group whose joints are a subset of the state group's. Passing the
+     *              state group's own name is the same as clearIKGroupName().
+     */
+    void setIKGroupName(const std::string& group) {
+        ik_group_name_ = group;
+    }
+
+    /// Returns the solver to using every joint of the state group.
+    void clearIKGroupName() {
+        ik_group_name_.clear();
+    }
+
+    /// The group the solver may move: the override if one is set, else the state group.
+    const std::string& getIKGroupName() const {
+        return ik_group_name_.empty() ? group_name_ : ik_group_name_;
+    }
+
+    /// The override alone, empty when none is set. Distinct from getIKGroupName() so a
+    /// caller that restores a previous setting can tell "unset" from "set to the state
+    /// group", which stop being the same thing once the state group changes.
+    const std::string& getIKGroupOverride() const {
+        return ik_group_name_;
     }
 
     // =========================================================================================
@@ -335,29 +384,47 @@ private:
     VisibilityToolParams tool_params_;
     std::string group_name_;
     std::string ee_link_name_; // End Effector Link (Camera frame)
+    /// Empty means the solver may move every joint of the state group. See
+    /// setIKGroupName().
+    std::string ik_group_name_;
 
     size_t num_steps = 20;
 
 
     /**
      * @brief Helper function to check IK with collision detection
+     *
+     * Solves over the IK group but seeds from, validates against, and returns the
+     * state group, so restricting the solver never changes the shape of a
+     * configuration vector.
      */
     bool checkIK(const Eigen::Isometry3d& target_pose, std::vector<double>& solution_out) {
-        const moveit::core::JointModelGroup* jmg = robot_model_->getJointModelGroup(group_name_);
+        const moveit::core::JointModelGroup* state_jmg = robot_model_->getJointModelGroup(group_name_);
+        const moveit::core::JointModelGroup* ik_jmg    = robot_model_->getJointModelGroup(getIKGroupName());
+
+        if (!state_jmg) throw std::runtime_error("VisualIK: no joint model group named '" + group_name_ + "'.");
+        if (!ik_jmg)    throw std::runtime_error("VisualIK: no joint model group named '" + getIKGroupName() + "' to solve IK over.");
+
         double timeout = 0.1;
 
-        // Callback to check collisions using ValidityChecker
-        moveit::core::GroupStateValidityCallbackFn callback = 
-            [this](moveit::core::RobotState* state, const moveit::core::JointModelGroup* group, const double* values) {
-                std::vector<double> q(values, values + group->getVariableCount());
+        // The candidate carries values for the IK group only, so it is applied to the
+        // state first and the full state-group configuration read back out: the joints
+        // the solver may not move keep their seed values, and the collision check sees
+        // the whole robot either way.
+        moveit::core::GroupStateValidityCallbackFn callback =
+            [this, state_jmg](moveit::core::RobotState* state, const moveit::core::JointModelGroup* group, const double* values) {
+                state->setJointGroupPositions(group, values);
+                state->update();
+                std::vector<double> q;
+                state->copyJointGroupPositions(state_jmg, q);
                 return this->validity_checker_->isValid(q);
             };
 
         // setFromIK uses the current state of robot_state_ as the seed
-        bool found_ik = robot_state_->setFromIK(jmg, target_pose, ee_link_name_, timeout, callback);
+        bool found_ik = robot_state_->setFromIK(ik_jmg, target_pose, ee_link_name_, timeout, callback);
 
         if (found_ik) {
-            robot_state_->copyJointGroupPositions(jmg, solution_out);
+            robot_state_->copyJointGroupPositions(state_jmg, solution_out);
             return true;
         }
         return false;

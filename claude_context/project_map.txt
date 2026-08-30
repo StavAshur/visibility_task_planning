@@ -1,6 +1,6 @@
 PROJECT MAP
 ===========
-Last updated: 2026-07-20 (rewritten from Claude Code with direct repo access)
+Last updated: 2026-08-30 (multi-target coverage queries; global_plan step 2)
 
 PURPOSE OF THIS FILE
 --------------------
@@ -34,11 +34,15 @@ The material falls into three groups:
 
   (C) The ROS package -- this repository. It implements Group A (the TVMP paper:
       VI-tree, VisIK, VisPRM, VisRRT, plus the VIR baseline) and its experiment
-      harness. NONE of the Group B / global_plan.txt VisTSP components exist yet;
-      see "VisTSP BACKLOG vs. CODE" at the end.
+      harness. Of the Group B / global_plan.txt VisTSP components, steps 1 and 2
+      exist -- the VI-tree multi-target query and the coverage query mode on
+      both planners -- neither yet exercised by a real caller; see "VisTSP
+      BACKLOG vs. CODE" at the end.
 
 CURRENT STATE IN ONE LINE: the paper's planners are implemented, evaluated, and
-running on hardware; the VisTSP extension has not been started in code.
+running on hardware; the VisTSP extension has its VI-tree multi-target query and
+its k-coverage planner queries written and compiling, and nothing yet consumes
+them.
 
 
 ==============================================================================
@@ -169,7 +173,11 @@ config/planner_config.yaml
   Role: The single knob-board for the planner service; loaded into
     visual_planning_node's private namespace by visual_planner.launch.
   Significance: Every switch that selects WHICH algorithm runs lives here.
-  Contents: mode ("VisRRT"|"VisPRM"); use_visual_ik; use_visibility_integrity;
+  Contents: mode ("VisRRT"|"VisPRM"); snap_fov_on_insert (default true) and
+    snap_fov_on_scan (default false) -- these REPLACED use_visual_ik on
+    2026-08-30, and the node refuses to start if the retired name is still set
+    anywhere, since a silently ignored parameter would run the wrong algorithm;
+    use_visibility_integrity;
     use_visibility_roadmap; time_cap (s); group_name ("whole_robot");
     ee_link_name (currently "light_beam" -- note the commented-out history:
     ur_arm_tool0 / tool0 / flashlight); resolution; visibility_threshold;
@@ -248,7 +256,12 @@ common/Types.h
     PRMParams {num_neighbors, num_samples, max_goals, edge_validation_method,
     max_size}; VisibilityIntegrityParams {num_samples, num_roadmap_samples,
     vi_threshold, k_neighbors, face_samples, limit_diameter_factor};
-    VisibilityToolParams {beam_angle (HALF-angle, rad), beam_length}.
+    VisibilityToolParams {beam_angle (HALF-angle, rad), beam_length};
+    BaseLocality {enabled, delta, center, ik_group} -- the optional cap on how
+    far the mobile base may travel during a coverage query, a DISK of radius
+    delta around the root configuration's base. ik_group ("manipulator") is the
+    group VisualIK is restricted to while it is active, so no IK solution can
+    move the base out of the disk.
 
 --- include/visual_based_planning/planners/ ----------------------------------
 
@@ -281,6 +294,13 @@ planners/PlanningContext.h  (~337 lines)
       pointers.
     - sampleVisibilityRegion(): the VI-tree / VIR roadmap dispatch, selected by
       use_visibility_roadmap_ (default false = VI-tree).
+    - queryMultiTarget(): the VI-tree's multi-target query, returning false when
+      the VI-tree is not the active structure or was never built -- a caller
+      must not read that as "no region sees these targets".
+    - basePosition(q): the mobile base's (x,y) for a configuration, read from
+      the group's first two variables. THE one place that assumption lives; see
+      CROSS-CUTTING NOTE 7. Throws on a configuration too short to hold one,
+      rather than answering (0,0) and putting the base at the world origin.
     - getCurrentJoints(): the robot's current configuration, used to seed a
       planner's default start.
     - solveFK(), the component accessors, and every context-level setter.
@@ -290,39 +310,75 @@ planners/PlanningContext.h  (~337 lines)
     "manipulator" commented out; workspace_bounds_ is hardcoded in the
     constructor before config overrides it.
 
-planners/VisibilityPlannerBase.h  (~314 lines)
+planners/VisibilityPlannerBase.h  (~700 lines)
   Role: Common base for the visibility planners: the state of ONE run, plus the
     primitives every algorithm is written in terms of.
-  Significance: The abstraction the node and the factory talk to. Declares
-    `virtual bool plan() = 0`.
+  Significance: The abstraction the node and the factory talk to. Declares BOTH
+    pure virtuals: `plan()` (single target, returns a path) and `planCoverage()`
+    (many targets, returns a labelled vertex set). Also defines CoverageResult
+    and IKGroupGuard at namespace scope.
   Contents:
     - Holds shared_ptr<PlanningContext> as ctx_, plus per-run state: graph_, nn_,
       root_id_, checked_vertices_, start_joint_values_, target_mes_,
       result_path_, rng_.
-    - Holds BOTH RRTParams and PRMParams. Deliberate: the strategies mix --
-      VisRRG extends like an RRT and connects to k nearest like a PRM.
+    - MULTI-TARGET COVERAGE (global_plan step 2), all shared by both planners:
+      state targets_/coverage_k_/min_goal_separation_/locality_/coverage_, and
+      the helpers beginCoverageRun (validate + reset + the unseeable-target
+      warning), reportUnseeableTargets, sampleLocalUniform (uniform sample with
+      the base drawn inside the locality disk), inLocality, recordVisibleTargets
+      (the per-vertex test against every unsatisfied target, plus the VisIK
+      snap), creditTarget, coverageComplete (recomputes deficits; the ONLY place
+      they are refreshed), isReachable (virtual), pickUnsatisfiedTarget,
+      logCoverageSummary. The two search LOOPS stay in the planners.
+    - The coverage query's promise is "k configurations per target, reachable
+      from the start". goals[t] holds CANDIDATES; reachability is evaluated when
+      completeness is checked, because a roadmap vertex can be disconnected when
+      found and connected later.
+    - snap_fov_on_insert_ (default true) / snap_fov_on_scan_ (default false):
+      whether the VisIK snap may run on a vertex being ADDED, and on one the
+      graph already held. Separate because the scan can face thousands of
+      pre-existing vertices at once. recordVisibleTargets takes the applicable
+      one as an ARGUMENT -- only the call site knows which case it is.
+    - Holds BOTH RRTParams and PRMParams. Deliberate: the strategies mix -- the
+      base's own connectToGraph() primitive reads PRMParams
+      (edge_validation_method, num_neighbors) while extend() reads RRTParams, so
+      either planner can reach for either. (This slot used to be justified by
+      VisRRG, which was dropped on 2026-08-26; the mixing is still real.)
     - attachScene() vs setPlanningScene(): attachScene only points nn_ at a
       scene (two assignments); setPlanningScene also rebuilds the context. The
       split exists because NearestNeighbor returns NO neighbours at all while it
       has no scene, so a freshly built planner must be attached -- but attaching
       must not cost a VI-tree rebuild.
     - Primitives: interpolate/distance/validateEdge/extend, addState, reset,
-      computeTargetMES, connectToGraph, sampleVisibilityGoal, finalizePath.
+      computeTargetMES, connectToGraph, sampleVisibilityGoal (takes the target
+      as an argument; the no-target overload uses target_mes_), finalizePath.
     - Forwarding setters so callers configure a planner through one object.
       setUseVisibilityIntegrity() also sets the context's structure flag, so
       guidance can never be on while the structure it queries was never built.
 
-planners/VisRRTPlanner.h  (~173 lines)
+planners/VisRRTPlanner.h  (~270 lines)
   Role: Visibility RRT. Maps onto Alg. vis:rrt in claude_context/4_Method.tex.
   Contents: plan() -- RRT with (a) goal-biased sampling drawn from the visibility
     structure, (b) a per-node direct-visibility goal test via
     checkBallBeamVisibility, (c) a VisIK "snap" branch converting a well-placed
     POSITION into a target-facing CONFIGURATION. Wall-clock capped by time_cap_.
-    use_visual_ik_ (ctor arg, default true) gates the snap; with it off the
+    snap_fov_on_insert_ (ctor arg, default true) gates the snap; with it off the
     algorithm degrades to a plain RRT that only succeeds on direct visibility.
+    planCoverage() -- the same search asked the multi-target question: the
+    goal-biased draw aims at one target still short of coverage, every new node
+    goes through recordVisibleTargets, and the tree keeps growing until ALL
+    targets are satisfied. isReachable() is overridden to `true`: the tree is
+    rooted at root_id_ and every vertex is attached to one already in it, so the
+    base class's per-goal BFS would rediscover a structural guarantee.
+  NOTE (2026-08-30): plan()'s snap now VERIFIES with the oracle that the snapped
+    configuration actually meets the visibility threshold before declaring
+    success. It previously trusted VisualIK, which picks the viewing point from
+    geometry alone and never consults the obstacles, so an occluded snap could
+    be reported as a solution. Stav accepted that the RA-L benchmarks need a
+    re-run because of this.
   Intended as a base for VisRRT variants.
 
-planners/VisPRMPlanner.h  (~268 lines)
+planners/VisPRMPlanner.h  (~390 lines)
   Role: Visibility PRM. Maps onto Alg. vis:prm in claude_context/4_Method.tex.
   Contents: plan() uses the configured start, or samples a random valid one while
     rejecting the double-room interior box (0<x<2.25, |y|<2.25), then delegates
@@ -331,15 +387,32 @@ planners/VisPRMPlanner.h  (~268 lines)
     PRM's amortized cost low in the paper's results), scans existing nodes for
     visibility, samples goals via the visibility structure, and returns a
     Dijkstra path.
+    planCoverage() -- scans what the roadmap ALREADY holds against all targets
+    (with snap_fov_on_scan_), then alternates goal sampling for one unsatisfied
+    target with roadmap expansion (with snap_fov_on_insert_). max_goals keeps its
+    meaning -- a cap on how many goal configurations are HELD, since sampling
+    them is expensive and past a handful the useful work is connecting the ones
+    already found -- but is now counted PER TARGET, one shared budget being
+    spent by whichever targets came up first. Note it should be >= the coverage
+    k, or goal sampling stops before a target can be satisfied by it (roadmap
+    expansion can still credit vertices, so it is a slowdown, not a wall).
+    Goal samples are added even when they connect
+    to nothing, since an isolated candidate becomes creditable once the roadmap
+    grows around it. The graph is NOT reset and there is no guard against
+    reusing it under a different constraint -- see the note below.
   Intended as a base for VisPRM variants.
 
 planners/PlannerFactory.h  (~67 lines)
   Role: Maps a mode string to a planner instance.
-  Significance: The single place a new planner is registered -- adding VisRRG
-    means one new file plus one branch here, with no change to the node.
-  Contents: PlannerOptions (use_visual_ik, use_visibility_integrity,
-    shortcutting, time_cap, RRTParams, PRMParams) and createPlanner(mode, ctx,
-    opts). Accepts exactly "VisRRT" and "VisPRM"; returns nullptr for anything
+  Significance: The single place a new planner is registered -- a new algorithm
+    means one new file plus one branch here, with no change to the node. Note
+    the VisTSP multi-target work does NOT add one: it extends the two existing
+    planners rather than introducing a third (decision 2026-08-26).
+  Contents: PlannerOptions (snap_fov_on_insert, snap_fov_on_scan,
+    use_visibility_integrity, shortcutting, time_cap, RRTParams, PRMParams) and
+    createPlanner(mode, ctx, opts). Both snap flags are applied to EVERY planner,
+    not only VisRRT: VisPRM uses the snap inside planCoverage().
+    Accepts exactly "VisRRT" and "VisPRM"; returns nullptr for anything
     else, which callers treat as fatal rather than falling back.
   Gotcha: the old node dispatched on `mode.find("PRM") != npos`, so unrecognised
     strings silently ran VisRRT. Matching is now exact.
@@ -384,6 +457,20 @@ components/VisualIK.h
     along the segment calling IK at each step; overloads for a point list;
     maintainOrientationVisualIK() (keep current EE orientation);
     greedyOrientationVisualIK() (recompute a look-at orientation first).
+  TWO GROUPS (2026-08-30): the STATE group (setGroupName) says what a
+    configuration vector means -- what seeds are expressed in, what FK is read
+    from, what solutions are returned in. The IK group (setIKGroupName) says
+    which of those joints the solver may MOVE, defaulting to the state group.
+    Set to "manipulator" while a base-locality constraint is active, so a
+    solution inherits its seed's base position and cannot leave the disk;
+    joints outside the IK group keep their seed values, so inputs and outputs
+    stay full state-group vectors either way. checkIK's validity callback
+    applies the candidate to the state and reads the FULL state-group vector
+    back before collision checking -- with a subgroup, handing ValidityChecker
+    the group's own values would pass 6 numbers to a 9-variable group.
+    IKGroupGuard (VisibilityPlannerBase.h) is what scopes the restriction: this
+    object is shared through PlanningContext, so an unrestored setting would
+    leave every later query solving arm-only.
   Known issues, marked in-file with @todo: the search direction/step-size logic
     is flagged WRONG by the author ("dir should be equal to v, step size should
     differ per direction"), and there is a commented-out hard-coded flashlight
@@ -452,6 +539,15 @@ data_structures/VisibilityIntegrity.h  (the VI-TREE -- key contribution)
       to the highest-level node was considered and rejected, because the
       per-node scores record how well each part of a subtree sees the target and
       that resolution would be lost.
+      Its first caller (2026-08-30) is VisibilityPlannerBase::
+      reportUnseeableTargets, reached through PlanningContext::queryMultiTarget:
+      a warning that a target no region sees cannot be covered however long the
+      search runs. Advisory only -- a region's score is an aggregate over the
+      region, so passing does not promise any single configuration in it sees
+      the target.
+    - isBuilt(): whether build() has produced a tree. Every query answers
+      emptily until it has, which a caller cannot otherwise tell apart from
+      "nothing sees the target".
     - Sparse accumulator (accum_ + touched_): the ball query sums each seer's
       fractions through a flat vector indexed by node id rather than a linear
       scan over the output, turning O(covering * list * seers) into
@@ -515,6 +611,15 @@ data_structures/VisibilityOracle.h
       frame, require +Z half-space, distance <= beam_length, and
       cos(angle) >= cos(beam_angle).
     - isPointInBeam() = isPointInFOV && unoccluded segment.
+    - ballOutsideBeam(): closed-form rejection of a ball ENTIRELY outside the
+      beam, run first thing inside checkBallBeamVisibility. A ball only
+      partially inside is never rejected: for a sensor outside it, the
+      directions to its points fill exactly the tangent cone of half-angle
+      asin(r/d), and two cones are disjoint only when their axes differ by more
+      than the sum of their half-angles. Where it fires, the sampling loop would
+      have found nothing in the field of view and returned 0.0, so it changes
+      cost and not results. Added for the multi-target coverage queries, which
+      test every vertex against every uncovered target.
     - checkBallBeamVisibility(): the central scoring function -- Monte-Carlo
       samples num_samples_ (100) points in the target ball and returns the
       illuminated fraction. Overloads take an Isometry3d pose, a joint vector
@@ -574,15 +679,21 @@ src/visual_planning_node.cpp
     "plan_visibility_path".
     - loadStaticConfig(): reads every parameter from the PRIVATE namespace
       (planner_config.yaml). Context-level values go straight to ctx_;
-      planner-level ones (RRT/PRM params, time cap, use_visual_ik) are RETAINED
-      as members so a rebuilt planner can be configured identically.
+      planner-level ones (RRT/PRM params, time cap, snap_fov_on_insert,
+      snap_fov_on_scan) are RETAINED as members so a rebuilt planner can be
+      configured identically. First calls rejectRetiredParams(), which REFUSES
+      TO START if a config still sets a renamed parameter (currently
+      use_visual_ik -> snap_fov_on_insert): ROS reports nothing for a parameter
+      nobody reads, so the run would silently take the new default and, for this
+      one, benchmark the wrong algorithm.
     - rebuildPlanner(scene, mode): builds the planner named by mode on the
       existing context and attachScene()s it. Cheap -- no VI-tree rebuild.
       Returns false on an unknown mode; the constructor treats that as fatal and
       a request treats it as a failed request. There is deliberately NO fallback
       to a default planner.
     - updatePlannerParams(): on EVERY service call, re-reads five switches from
-      the GLOBAL namespace (/planner/use_visual_ik, /planner/use_visibility_integrity,
+      the GLOBAL namespace (/planner/snap_fov_on_insert,
+      /planner/snap_fov_on_scan, /planner/use_visibility_integrity,
       /planner/use_visibility_roadmap, /planner/enable_shortcutting, planner/mode)
       and sets params_changed_ if any differ. This is the mechanism
       experiment_runner uses to switch algorithms without restarting the node.
@@ -610,11 +721,14 @@ src/experiment_runner.cpp
   Significance: The single best file for understanding the experimental protocol
     in claude_context/5_Experiments.tex.
   Contents:
-    - Five configurations compared, each a (mode, use_visual_ik,
+    - Five configurations compared, each a (mode, snap_fov_on_insert,
       use_visibility_integrity, use_visibility_roadmap) tuple:
         VisRRT (VisRRT + VisIK), RRT (plain), VisPRM (PRM + VI-tree),
         VIR (PRM + visibility roadmap = the baseline), PRM (plain).
-      Switched at runtime by setting the global /planner/* params.
+      Switched at runtime by setting the global /planner/* params. The table is
+      positionally initialised, so the 2026-08-30 rename of use_visual_ik cost
+      it no edit; /planner/snap_fov_on_scan is pinned false per run so a run
+      cannot inherit it from the previous one.
     - generateTargetProblemsFromRegions(): loads sampling_regions_double_room.yaml,
       pulls the real obstacle AABBs out of the live MoveIt planning scene, and
       pre-generates 200 target problems -- each a sphere sampled inside a region
@@ -681,6 +795,40 @@ CROSS-CUTTING NOTES (things that will bite you)
    (`if (false)`); ball visibility scoring is CPU-bound.
 6. The PRM roadmap deliberately PERSISTS across service calls; only a param
    change or scene change resets it. Timing numbers only make sense in that light.
+7. TARGET ROBOTS ARE EXACTLY TWO (Stav, 2026-08-30): the SIMULATED mobile UR5,
+   whose base x/y are prismatic joints anchored to the centre of the
+   environment, and the REAL Husky + UR5. Nothing else -- no other robot,
+   simulated or otherwise, needs to be supported. Generality is explicitly worth
+   trading away for simpler code here. Concretely, the first two variables of
+   the planning group ARE the base translation, and code may rely on it.
+   Where the base is gets asked through PlanningContext::basePosition() so that
+   the real Husky, which will report its base from localization rather than
+   from a joint value, changes one method (or backs it with a ROS service)
+   instead of every caller.
+   OPEN RISK on the real Husky, flagged by Stav as untried (2026-08-30), and
+   UNVERIFIED against their setup:
+   (a) Getting the base position may not need new code at all. If the Husky's
+       base is a PLANAR VIRTUAL JOINT (map -> base_link) inside the planning
+       group, q[0]/q[1] stay the base translation and PlanningSceneMonitor
+       already fills the current state from TF; the work is then SRDF plus a
+       localization source, not C++. basePosition() only has to change if the
+       base ends up OUTSIDE the planning group.
+   (b) The harder problem is that a Husky is DIFFERENTIAL-DRIVE while the
+       simulated base is two prismatic joints, which slide sideways. Every base
+       path this code plans is therefore a relaxation the real robot may not be
+       able to execute. Under a small locality disk the base barely moves so it
+       is minor; for the global tour over base locations (global_plan step 6) it
+       is not, and nothing in the repo addresses it yet.
+8. ONE PLANNER PER REGION is the contract for the VisTSP pipeline (Stav,
+   2026-08-30). Whenever a graph is needed -- local or global -- construct a
+   planner and take its graph; each local region gets its own, because each
+   region's tour is computed from its own graph. This is why the base-locality
+   constraint needs no guard against a roadmap built under a different disk:
+   there is no shared mutating roadmap to protect. Reusing one planner with a
+   LARGER delta is legitimate, its vertices all still being inside, and
+   shrinking one is the caller's business -- recordVisibleTargets tests
+   inLocality on the vertex it is given, so the answer stays correct either way.
+   A freshly constructed planner must be attachScene()d before it can plan.
 
 
 ==============================================================================
@@ -694,10 +842,41 @@ global_plan.txt
   Role: The project's global plan. DO NOT EDIT (CLAUDE.md item 4).
   Contents: implement VisTSP (search/illuminate/film a SET of targets), via a
     6-step ordered task list: (1) multi-target query for the VI-tree,
-    (2) Local VisRRG, (3) "Greek TSP" algorithm, (4) LocalVisTSP,
+    (2) multi-target queries for VisRRT and VisPRM, (3) "Greek TSP" algorithm,
+    (4) LocalVisTSP,
     (5) covering algorithm (cover regions with copies of the reachable volume),
     (6) TSP over the 2D base locations. Steps 1-4 are the LOCAL pipeline,
     5-6 the GLOBAL pipeline; together they are the GLVisTSP framework.
+  SUPERSEDED STEP 2 (Stav's decision, 2026-08-26): VisRRG will NOT be
+    implemented. Step 2 is instead a MULTI-TARGET QUERY MODE for the existing
+    VisRRT and VisPRM, taking a set of target balls plus an optional COVERAGE
+    parameter k -- the number of reachable configurations that must see each
+    target. This is step 1 of the VisCfgTSP framework in VisTSP_frameworks.txt
+    ("configurations s.t. every target is watched by at least K configurations")
+    and it feeds the same downstream steps VisRRG would have fed. Reusing the
+    two planners also keeps one code path per algorithm instead of a third.
+    Stav updated global_plan.txt himself on 2026-08-30 to match; that file is
+    his alone to edit (CLAUDE.md item 4), and this entry carries the reasoning
+    the one-line plan has no room for.
+  STEP 2 ALSO INCLUDES an OPTIONAL LOCALITY CONSTRAINT (same decision): the
+    multi-target query may cap how far the mobile base travels. The constraint
+    is a DISK -- the base stays within delta of the ROOT configuration's base
+    position -- not the axis-aligned box B of local_VisTSP.txt. This is what
+    makes the same query serve as the "local" planner of LocalVisTSP (step 4),
+    where subproblem 3 requires the base within delta of a location, so no
+    separate local planner is needed. delta is optional: unset means the
+    unconstrained multi-target query.
+  VisIK UNDER THE LOCALITY CONSTRAINT (decision NOT final, revisit if a better
+    option appears): call VisIK on the "manipulator" group instead of
+    "whole_robot", so the solver cannot move the base at all. Rationale: IK over
+    whole_robot is free to place the base anywhere in its joint range, so a snap
+    can silently leave the disk; solving arm-only makes the constraint hold by
+    construction for every snapped configuration. Cost: less IK freedom, so
+    targets reachable only by shifting the base slightly are not snapped -- they
+    have to be covered from a different node whose base the SAMPLER moved (which
+    stays inside the disk anyway). The alternative left on the table is
+    whole_robot IK with a disk validity callback on setFromIK: more freedom, but
+    it relies on random seed restarts to land inside the disk.
 
 1_introduction.tex
   Role: Introduction (\label{sec:intro}).
@@ -780,6 +959,12 @@ local_VisTSP.txt
     traversal -> shortcut with a local planner, falling back to RRT/VisRRT when a
     shortcut is hard (the interesting case); LocalVisTSP = Local VisRRG then
     GreekTSP.
+  PARTLY SUPERSEDED (2026-08-26): the Local VisRRG half is not being built (see
+    the global_plan.txt entry above); multi-target VisRRT/VisPRM produce the
+    labelled goal configurations instead. What survives unchanged is the ROLE
+    that structure plays: the k-per-target coverage requirement, the locality
+    constraint (as a DISK, see below, not the box B), and the GreekTSP half,
+    which still consumes a graph plus per-target goal vertices.
 
 project_map.txt
   Role: This file.
@@ -802,12 +987,17 @@ global_plan.txt step               Status   Where it would go
                                             pruning must decide how to treat a
                                             region whose ancestor is also
                                             present.
-2. Local VisRRG                    MISSING  New planners/VisRRGPlanner.h,
-                                            deriving from
-                                            VisibilityPlannerBase + one branch
-                                            in PlannerFactory. Reuses Sampler,
-                                            VisualIK, VisibilityOracle,
-                                            GraphManager.
+2. Multi-target coverage query     DONE     planCoverage() on both planners,
+   on VisRRT + VisPRM, with a               with the shared machinery in
+   coverage k and an optional               VisibilityPlannerBase. Compiles
+   base-locality disk (REPLACED             (g++ 7.5, Melodic container);
+   Local VisRRG, 2026-08-26)                UNEXERCISED -- no caller invokes it,
+                                            so its behaviour is unverified.
+                                            Deliverable is the graph plus
+                                            per-target goal vertices, NOT a
+                                            path: the tour is step 3's job and
+                                            needs goal-to-goal costs, which the
+                                            graph already answers.
 3. Greek TSP (MST + shortcut)      MISSING  New; GraphManager would need an MST
                                             (Boost has kruskal/prim) and the
                                             shortcut step can reuse
@@ -819,7 +1009,9 @@ global_plan.txt step               Status   Where it would go
                                             the current stand-in).
 6. 2D TSP over base locations      MISSING  New.
 
-Everything else in the repo serves the TVMP paper (single target set). The
+The building blocks are in place for step 3: both planners now hand back a graph
+plus per-target goal vertices, which is what a tour needs. Everything else in the
+repo serves the TVMP paper (single target set). The
 building blocks the VisTSP steps will reuse are: VisibilityIntegrity (both
 queries + SampleFromVisibilityRegion), VisualIK, VisibilityOracle (especially
 the cached GPU matrix + seen-by-all/any reductions), Sampler, GraphManager,
@@ -836,8 +1028,11 @@ benchmark harness that produced 5_Experiments.tex. The VisTSP notes (Part 2,
 Group B) reuse those same primitives -- above all the VI-tree query and VisIK --
 to build multi-target coverage: regions from the VI-tree, base locations covering
 those regions, a global tour over locations, and local visibility tours at each
-stop. global_plan.txt sequences that into 6 build steps, none of which are
-implemented yet (Part 3).
+stop. global_plan.txt sequences that into 6 build steps, of which only step 1 is
+written (Part 3). The reuse is now literal rather than conceptual: as of
+2026-08-26 the local coverage stage is not a new planner but a multi-target,
+k-coverage, base-locality-constrained query mode ON VisRRT and VisPRM
+themselves.
 
 
 MAINTENANCE NOTES

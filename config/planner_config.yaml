@@ -1,6 +1,11 @@
 planner:
   mode: "VisRRT" # "VisRRT" or "VisPRM"
-  use_visual_ik: true
+  # Snap a vertex being added, whose position sees the target, into one that looks at
+  # it. This is the VisualIK variant of VisRRT.
+  snap_fov_on_insert: true
+  # The same while scanning vertices the roadmap already held (VisPRM coverage queries
+  # only). Expensive on a large persistent roadmap, so off unless asked for.
+  snap_fov_on_scan: false
   use_visibility_integrity: false
   use_visibility_roadmap: false
   time_cap: 120 #seconds

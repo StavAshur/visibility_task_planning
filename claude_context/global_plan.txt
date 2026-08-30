@@ -1,6 +1,6 @@
 The current plan is to implement an algorithm for the visibility travelling-salesman problem (VisTSP), where the task is to search/illuminate/film a set of targets.
 1. Write the multi-target query for the VI-tree
-2. Implement Local VisRRG
+2. Implement multi-target querues for VisRRT and VisPRM
 3. Impement Greek TSP alg
 4. Implement LocalVisTSP
 5. Implement the covering algorithm (covering regions with robot reachable volume copies)
