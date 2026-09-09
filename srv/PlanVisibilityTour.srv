@@ -1,0 +1,59 @@
+# Plan a visibility tour over several targets (global_plan step 4, LocalVisTSP).
+#
+# WHAT vs HOW. This request says WHAT to solve. HOW to solve it -- which
+# insertion rules run, whether 2-opt runs, the coverage k, and the base-locality
+# radius -- comes from the planner/vistsp/* parameters, which the node re-reads
+# on every call. That split matches the rest of the node, where every knob is a
+# parameter, and it avoids ROS messages' lack of optional fields: an unset bool
+# would arrive as false and silently disable an algorithm.
+#
+# LOCAL OR GLOBAL. planner/vistsp/base_locality_radius <= 0 leaves the base
+# unconstrained, which runs the same pipeline over the whole environment. That
+# is the intended baseline (VisCfgTSP), not a misconfiguration.
+
+VisibilityTarget[] targets      # one ball per target; must not be empty
+float64[] start_joints          # empty = use the robot's current state
+string planner_type             # "VisRRT" or "VisPRM"; empty = planner/mode
+---
+bool success
+
+# The best tour, expanded and (if shortcutting is on) smoothed per leg. Starts
+# at the start configuration and returns to it, since the tour is a cycle.
+trajectory_msgs/JointTrajectory trajectory
+
+# Index in trajectory.points of each tour stop, in visiting order -- the leg
+# boundaries. Two equal consecutive values mean one configuration serves
+# several targets, so no motion happens between those stops.
+int32[] stop_indices
+
+# stop_target[i] is the target that stop i observes, or -1 for the start
+# configuration. Same length as stop_indices. This is what lets a client draw
+# which configuration is watching which target.
+int32[] stop_target
+
+# One entry per insertion rule that ran, in a fixed order, so two runs compare
+# line by line. construction_costs is the tour before 2-opt and improved_costs
+# after it; they are equal where 2-opt was off or found nothing. `best` indexes
+# these arrays.
+string[] algorithm_names
+float64[] construction_costs
+float64[] improved_costs
+int32 best
+
+# Wall-clock breakdown in seconds. Reported per phase because a single total
+# would be almost entirely the coverage query and would hide everything the tour
+# layer does. instance_seconds is where the metric closure runs its one Dijkstra
+# per distinct goal vertex and is expected to dominate gtsp_seconds by orders of
+# magnitude; these fields are what test that rather than assuming it. Populated
+# even on failure, up to the phase that failed.
+float64 coverage_seconds
+float64 instance_seconds
+float64 gtsp_seconds
+float64 expand_seconds
+float64 total_seconds
+
+# True when the coverage query did not reach k configurations for every target.
+# NOT a failure: a tour needs only one reachable configuration per target, so
+# the tour above may still be perfectly good. A target with none at all makes
+# the whole call fail instead.
+bool coverage_incomplete

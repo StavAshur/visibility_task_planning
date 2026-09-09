@@ -1,6 +1,8 @@
 #pragma once
 
 #include <string>
+#include <vector>
+#include <cmath>
 
 #include <Eigen/Core>
 
@@ -11,6 +13,46 @@ namespace visual_planner {
         Eigen::Vector3d center;
         double radius;
     };
+
+    /**
+     * @brief A ball containing every given point: the centroid, plus the
+     *        distance from it to the farthest point.
+     *
+     * NOT the true minimum enclosing sphere -- it is centred on the CENTROID,
+     * so it can be larger than the optimum. That is deliberate: this is exactly
+     * the arithmetic VisibilityPlannerBase::computeTargetMES() has always used,
+     * and every visibility number in the repo was produced with this
+     * definition. Replacing it with a real MES would silently move those
+     * results.
+     *
+     * Extracted as a free function (2026-09-09) so that turning a point cloud
+     * into a target ball is available wherever an input is read -- a client
+     * parsing a YAML file, say -- without duplicating the arithmetic. THIS IS
+     * THE ONLY PLACE THE CONVERSION LIVES; see the note on target
+     * representations in claude_context/project_map.txt.
+     */
+    inline Ball enclosingBall(const std::vector<Eigen::Vector3d>& points) {
+        Ball ball;
+        ball.center = Eigen::Vector3d::Zero();
+        ball.radius = 0.0;
+        if (points.empty()) return ball;
+
+        Eigen::Vector3d centroid(0.0, 0.0, 0.0);
+        for (size_t i = 0; i < points.size(); ++i) {
+            centroid += points[i];
+        }
+        centroid /= static_cast<double>(points.size());
+
+        double max_dist_sq = 0.0;
+        for (size_t i = 0; i < points.size(); ++i) {
+            const double d_sq = (points[i] - centroid).squaredNorm();
+            if (d_sq > max_dist_sq) max_dist_sq = d_sq;
+        }
+
+        ball.center = centroid;
+        ball.radius = std::sqrt(max_dist_sq);
+        return ball;
+    }
 
     enum class EdgeCheckMode {
         LINEAR,

@@ -10,6 +10,7 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   geometry_msgs
   trajectory_msgs
+  visualization_msgs
   message_generation
   moveit_core
   moveit_ros_planning
@@ -32,11 +33,13 @@ add_service_files(
   FILES
   VisualIK.srv
   PlanVisibilityPath.srv
+  PlanVisibilityTour.srv
 )
 
 add_message_files(
   FILES
   VisibilityTask.msg
+  VisibilityTarget.msg
 )
 
 generate_messages(
@@ -49,7 +52,7 @@ generate_messages(
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES visual_planner_lib
-  CATKIN_DEPENDS roscpp std_msgs geometry_msgs moveit_core moveit_ros_planning_interface
+  CATKIN_DEPENDS roscpp std_msgs geometry_msgs visualization_msgs moveit_core moveit_ros_planning_interface
 )
 
 include_directories(
@@ -99,6 +102,16 @@ add_dependencies(visual_planning_client ${catkin_EXPORTED_TARGETS} ${${PROJECT_N
 
 add_executable(experiment_runner src/experiment_runner.cpp)
 target_link_libraries(experiment_runner ${catkin_LIBRARIES} yaml-cpp)
+
+# Experiment driver for the VisTSP additions (global_plan steps 3-4).
+add_executable(vistsp_experiment_runner src/vistsp_experiment_runner.cpp)
+add_dependencies(vistsp_experiment_runner ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(vistsp_experiment_runner ${catkin_LIBRARIES} yaml-cpp)
+
+# Client for the VisTSP tour service (global_plan step 4).
+add_executable(visual_planning_tour_client src/visual_planning_tour_client.cpp)
+add_dependencies(visual_planning_tour_client ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(visual_planning_tour_client ${catkin_LIBRARIES} yaml-cpp)
 add_dependencies(experiment_runner ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 # add_executable(visual_planning_node src/visual_planning_node.cpp) 

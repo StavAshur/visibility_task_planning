@@ -1,0 +1,45 @@
+<launch>
+  <!--
+    Runs a VisTSP tour (global_plan step 4): the coverage query, the E-GTSP
+    insertion rules, 2-opt, and the expanded trajectory.
+
+    The node's planner/vistsp parameters decide WHICH algorithms run; this file
+    only says what to solve. Override them on the command line, e.g.
+        roslaunch visual_based_planning visual_planning_tour.launch \
+            base_locality:=0.0 two_opt:=true
+  -->
+
+  <arg name="targets_yaml"
+       default="$(find visual_based_planning)/config/vistsp_targets.yaml"/>
+  <!-- Empty leaves the node's planner/mode in charge. -->
+  <arg name="planner_type" default=""/>
+
+  <!-- Radius the base is confined to, in metres.
+       0.0 = GLOBAL run over the whole environment: the deliberate baseline
+       (VisCfgTSP), not a missing setting. > 0 = local run. -->
+  <arg name="base_locality" default="0.0"/>
+  <arg name="coverage" default="1"/>
+  <arg name="two_opt" default="true"/>
+  <arg name="nearest" default="true"/>
+  <arg name="farthest" default="true"/>
+  <arg name="cheapest" default="true"/>
+
+  <node name="visual_planning_node" pkg="visual_based_planning"
+        type="visual_planning_node" output="screen">
+      <rosparam command="load"
+                file="$(find visual_based_planning)/config/planner_config.yaml"/>
+      <!-- Loaded after the YAML so these win over the file's vistsp block. -->
+      <param name="planner/vistsp/base_locality_radius" value="$(arg base_locality)"/>
+      <param name="planner/vistsp/coverage"             value="$(arg coverage)"/>
+      <param name="planner/vistsp/use_two_opt"            value="$(arg two_opt)"/>
+      <param name="planner/vistsp/use_nearest_insertion"  value="$(arg nearest)"/>
+      <param name="planner/vistsp/use_farthest_insertion" value="$(arg farthest)"/>
+      <param name="planner/vistsp/use_cheapest_insertion" value="$(arg cheapest)"/>
+  </node>
+
+  <node name="visual_planning_tour_client" pkg="visual_based_planning"
+        type="visual_planning_tour_client" output="screen">
+      <param name="targets_yaml" value="$(arg targets_yaml)"/>
+      <param name="planner_type" value="$(arg planner_type)"/>
+  </node>
+</launch>

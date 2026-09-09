@@ -1,0 +1,59 @@
+<html><head>
+<meta http-equiv="content-type" content="text/html; charset=windows-1252">
+<link rel="stylesheet" href="Traveling%20Salesman%20Problem_farthest_insertion_files/VRSTYLE_zYio.CSS" type="text/css">
+
+
+<title>Traveling Salesman Problem</title>
+</head> 
+<body leftmargin="30" topmargin="30" class="Index" bgcolor="#FFFFFF">
+
+<!-- header-->
+
+
+<h2>TRAVELING SALESMAN PROBLEM
+<br>
+Insertion Algorithms<br></h2> <i class="reference">(Rosenkrantz, Stearns, Lewis, 1974)</i><br> 
+<p>
+</p><h3>Farthest Insertion</h3>
+<ul>
+<li><b>Step 1.</b> Start with a sub-graph consisting of node i only.
+</li><li><b>Step 2.</b> Find node r such that <i><b>c<sub>ir</sub></b></i>
+is <u>maximal</u> and form sub-tour <i><b>i-r-i</b></i>.
+</li><li><b>Step 3.</b> (Selection step) Given a sub-tour, find node <i><b>r</b></i>
+not in the sub-tour <u>farthest from</u> any node in the sub-tour; i.e. with maximal
+<i><b>c<sub>rj</sub></b></i>
+</li><li><b>Step 4.</b> (Insertion step) Find the arc <i><b> (i, j)</b> </i>
+in the sub-tour which minimizes <i><b>c<sub>ir</sub> + c<sub>rj</sub>
+- c<sub>ij</sub></b></i> . Insert <i><b>r</b></i> between <i><b>i</b></i>
+and <i><b>j</b></i>.
+</li><li><b>Step 5.</b> If all the nodes are added to the tour, stop. Else
+go to step 3
+</li></ul>
+<p>
+</p><p>
+Note how the underlined sections differ from "nearest insertion".
+<br>
+</p><p>
+</p><h4>Worst Case Behavior:</h4>
+
+<img src="Traveling%20Salesman%20Problem_farthest_insertion_files/IMG00016_zYio.GIF" align="middle"><br>
+<p>
+</p><h4>Number of Computations:</h4> 
+
+The farthest insertion algorithm is<img src="Traveling%20Salesman%20Problem_farthest_insertion_files/IMG00017_zYio.GIF" align="middle">.
+<br>
+<p>
+
+
+</p><p align="center"><img src="Traveling%20Salesman%20Problem_farthest_insertion_files/GOBOTH_zYio.GIF" align="middle" width="400" height="50" usemap="#Goto"><br>
+
+<map name="Goto">
+<area shape="RECT" coords="284,0,353,49" href="https://www2.isye.gatech.edu/~mgoetsch/cali/VEHICLE/TSP/TSP017__.HTM">
+<area shape="RECT" coords="17,0,87,49" href="https://www2.isye.gatech.edu/~mgoetsch/cali/VEHICLE/TSP/TSP013__.HTM">
+</map>
+
+
+<!-- footnote-->
+
+
+</p></body></html>

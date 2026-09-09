@@ -189,6 +189,10 @@ public:
     // ========================================================================
 
     void setShortcutting(bool enable) { shortcutting_ = enable; }
+    /// Whether path shortcutting is enabled. Added so LocalVisTSP can honour
+    /// this existing flag when smoothing a tour per leg, instead of carrying a
+    /// duplicate knob of its own (there was a setter but no getter).
+    bool getShortcutting() const { return shortcutting_; }
     void setRRTParams(const RRTParams& params) { rrt_params_ = params; }
     void setPRMParams(const PRMParams& params) { prm_params_ = params; }
     void setTimeCap(int time_cap) { time_cap_ = time_cap; }
@@ -280,6 +284,21 @@ public:
 
     // --- Accessors ---
     GraphManager& getGraph()               { return graph_; }
+
+    /**
+     * @brief The graph vertex holding the start configuration (the roadmap root).
+     *
+     * Added for the GTSP layer (GTSP_implementation_plan.txt sec. 3.3): the
+     * coverage tour's DEPOT is the start configuration, and a caller holding a
+     * planner had no way to name it -- root_id_ is protected and every other
+     * use of it was internal. This exposes state the caller already owns
+     * indirectly, since it set the start configuration itself, and adds no
+     * behaviour.
+     *
+     * @return The root vertex, or (VertexDesc)(-1) if no plan or coverage query
+     *         has run yet and the root was never inserted. Callers must check.
+     */
+    VertexDesc getRoot() const             { return root_id_; }
     NearestNeighbor& getNN()               { return nn_; }
     VisualIK& getVisualIK()                { return ctx_->getVisualIK(); }
     PathSmoother& getSmoother()            { return ctx_->getSmoother(); }
@@ -335,26 +354,15 @@ public:
     }
 
     void computeTargetMES(const std::vector<geometry_msgs::Point>& targets) {
-        if (targets.empty()) {
-            target_mes_ = {Eigen::Vector3d::Zero(), 0.0};
-        } else {
-            Eigen::Vector3d centroid(0, 0, 0);
-            for (const auto& p : targets) {
-                centroid += Eigen::Vector3d(p.x, p.y, p.z);
-            }
-            centroid /= targets.size();
-
-            double max_dist_sq = 0.0;
-            for (const auto& p : targets) {
-                Eigen::Vector3d pt(p.x, p.y, p.z);
-                double d_sq = (pt - centroid).squaredNorm();
-                if (d_sq > max_dist_sq) {
-                    max_dist_sq = d_sq;
-                }
-            }
-            target_mes_.center = centroid;
-            target_mes_.radius = std::sqrt(max_dist_sq);
+        // The arithmetic lives in enclosingBall() (common/Types.h) so that a
+        // client turning a point cloud into a target ball uses the same
+        // definition rather than a second copy of it. Behaviour is unchanged.
+        std::vector<Eigen::Vector3d> points;
+        points.reserve(targets.size());
+        for (const auto& p : targets) {
+            points.push_back(Eigen::Vector3d(p.x, p.y, p.z));
         }
+        target_mes_ = enclosingBall(points);
         ROS_INFO("Target MES has center = (%f,%f,%f) and radius = %f",
                 target_mes_.center.x(), target_mes_.center.y(), target_mes_.center.z(), target_mes_.radius);
     }

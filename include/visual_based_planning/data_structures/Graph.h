@@ -2,6 +2,7 @@
 #include <vector>
 #include <algorithm> // for std::reverse
 #include <limits>    // for infinity
+#include <numeric>   // for std::iota
 #include <iostream>  // for logging
 #include <fstream>
 #include <queue>
@@ -28,6 +29,33 @@ struct GraphEdge {
 typedef boost::adjacency_list<boost::vecS, boost::vecS, boost::undirectedS, GraphVertex, GraphEdge> PlannerGraph;
 typedef boost::graph_traits<PlannerGraph>::vertex_descriptor VertexDesc;
 typedef boost::graph_traits<PlannerGraph>::edge_descriptor EdgeDesc;
+
+/**
+ * @brief All-pairs shortest-path costs among a SUBSET of the graph's vertices,
+ *        with enough predecessor information to rebuild each pair's path.
+ *
+ * Produced by GraphManager::metricClosure() and consumed by the GTSP layer
+ * (claude_context/GTSP_implementation_plan.txt sec. 3.1): `cost` becomes the
+ * tour cost matrix, and `predecessor` is what turns a finished tour back into a
+ * roadmap path without re-running any search.
+ *
+ * Indices are positions in `nodes`, NOT vertex descriptors. That indirection is
+ * deliberate -- it is what lets the GTSP code be written against plain indices
+ * and stay free of graph types.
+ */
+struct SubsetClosure {
+    /// The subset, in index order. cost/predecessor are indexed by position here.
+    std::vector<VertexDesc> nodes;
+
+    /// n x n symmetric costs. INFINITY (not max()) means no path exists; see
+    /// the note in metricClosure() for why that distinction matters.
+    std::vector<std::vector<double>> cost;
+
+    /// predecessor[i] is the full Dijkstra predecessor map rooted at nodes[i],
+    /// indexed by VERTEX DESCRIPTOR over the whole graph -- so it is n x |V|.
+    /// Keeping it is the entire point of this struct (see metricClosure()).
+    std::vector<std::vector<VertexDesc>> predecessor;
+};
 
 class GraphManager {
 public:
@@ -167,6 +195,139 @@ public:
         // 5. Reverse to get Start -> Goal order
         std::reverse(path.begin(), path.end());
 
+        return path;
+    }
+
+    /**
+     * @brief All-pairs shortest paths among `subset`, as a SubsetClosure.
+     *
+     * Runs ONE single-source Dijkstra per subset vertex and keeps both the
+     * distances and the predecessor map from each.
+     *
+     * WHY THIS EXISTS RATHER THAN A DOUBLE LOOP OVER shortestPath().
+     * shortestPath() runs a full single-source Dijkstra and then throws the
+     * predecessor and distance maps away, keeping one path. Calling it for
+     * every pair therefore runs n^2 Dijkstras to recover information that n
+     * Dijkstras already contain, and it still cannot answer a second query from
+     * the same source without starting over. Here the maps are retained, which
+     * is also exactly what expanding a tour into a motion plan needs.
+     *
+     * UNREACHABLE PAIRS ARE INFINITY, NOT max(). BGL leaves unreached vertices
+     * at std::numeric_limits<double>::max() (its default distance_inf), which
+     * is a FINITE double. Downstream code tests reachability with
+     * `x < infinity()`, so passing max() through would make an unreachable pair
+     * look like a usable edge of astronomical cost -- a tour would be built
+     * through it and reported as feasible. The conversion below is the only
+     * place that is prevented, so do not remove it.
+     *
+     * COST: n Dijkstras, which dominates the whole GTSP pipeline -- the roadmap
+     * may have PRMParams::max_size = 10000 vertices while n is a few tens. Call
+     * it ONCE and reuse the result for every algorithm. Memory is O(n * |V|)
+     * VertexDesc for the predecessor maps, a few MB at those sizes.
+     *
+     * @param subset Distinct graph vertices. Duplicates are rejected: they
+     *        would silently create a zero-cost pair between two entries that
+     *        are the same vertex, which is indistinguishable from -- and would
+     *        corrupt -- the GTSP layer's split-copy glue.
+     * @return The closure, or an empty one on error (an invalid or duplicated
+     *         vertex), which callers must treat as fatal.
+     */
+    SubsetClosure metricClosure(const std::vector<VertexDesc>& subset) {
+        SubsetClosure closure;
+        const size_t num_nodes = boost::num_vertices(G_);
+        const int n = static_cast<int>(subset.size());
+        if (n == 0) return closure;
+
+        // Validate before doing |subset| Dijkstras' worth of work.
+        std::vector<char> already(num_nodes, 0);
+        for (int i = 0; i < n; ++i) {
+            if (subset[i] >= num_nodes) {
+                std::cerr << "[GraphManager] Error: metricClosure: vertex "
+                          << subset[i] << " is out of range (graph has "
+                          << num_nodes << ")." << std::endl;
+                return SubsetClosure();
+            }
+            if (already[subset[i]]) {
+                std::cerr << "[GraphManager] Error: metricClosure: vertex "
+                          << subset[i] << " appears twice in the subset; the"
+                          << " subset must be distinct vertices." << std::endl;
+                return SubsetClosure();
+            }
+            already[subset[i]] = 1;
+        }
+
+        closure.nodes = subset;
+        closure.cost.assign(n, std::vector<double>(
+            n, std::numeric_limits<double>::infinity()));
+        closure.predecessor.resize(n);
+
+        for (int i = 0; i < n; ++i) {
+            std::vector<VertexDesc> predecessors(num_nodes);
+            std::vector<double> distances(num_nodes);
+
+            boost::dijkstra_shortest_paths(G_, subset[i],
+                boost::predecessor_map(&predecessors[0])
+                .distance_map(&distances[0])
+                .weight_map(boost::get(&GraphEdge::weight, G_))
+            );
+
+            for (int j = 0; j < n; ++j) {
+                const double d = distances[subset[j]];
+                // See "UNREACHABLE PAIRS ARE INFINITY" above.
+                closure.cost[i][j] = (d >= std::numeric_limits<double>::max())
+                                   ? std::numeric_limits<double>::infinity()
+                                   : d;
+            }
+            closure.predecessor[i].swap(predecessors);
+        }
+        return closure;
+    }
+
+    /**
+     * @brief Rebuild the roadmap path between two closure entries.
+     *
+     * Walks the predecessor map that metricClosure() already computed for
+     * `from`, so this runs no search at all -- it is a backtrack.
+     *
+     * @param from, to Positions in closure.nodes, not vertex descriptors.
+     * @return The vertex path from closure.nodes[from] to closure.nodes[to],
+     *         both endpoints included. Empty if the pair is unreachable or the
+     *         indices are invalid. from == to yields the single vertex.
+     */
+    std::vector<VertexDesc> closurePath(const SubsetClosure& c,
+                                        int from, int to) const {
+        std::vector<VertexDesc> path;
+        const int n = static_cast<int>(c.nodes.size());
+        if (from < 0 || from >= n || to < 0 || to >= n) {
+            std::cerr << "[GraphManager] Error: closurePath: index out of range"
+                      << " (" << from << ", " << to << ") for " << n
+                      << " closure nodes." << std::endl;
+            return path;
+        }
+        if (!(c.cost[from][to] < std::numeric_limits<double>::infinity())) {
+            return path;   // unreachable: an empty path, not an error
+        }
+
+        const std::vector<VertexDesc>& predecessors = c.predecessor[from];
+        const VertexDesc start = c.nodes[from];
+        VertexDesc current = c.nodes[to];
+
+        while (current != start) {
+            path.push_back(current);
+            const VertexDesc parent = predecessors[current];
+            // A vertex is its own predecessor only at an unreached root, so
+            // this catches a predecessor map that disagrees with the distances.
+            if (parent == current) {
+                std::cerr << "[GraphManager] Error: closurePath: predecessor"
+                          << " map is broken between closure nodes " << from
+                          << " and " << to << "." << std::endl;
+                return std::vector<VertexDesc>();
+            }
+            current = parent;
+        }
+        path.push_back(start);
+
+        std::reverse(path.begin(), path.end());
         return path;
     }
 

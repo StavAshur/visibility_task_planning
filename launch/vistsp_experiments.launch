@@ -1,0 +1,48 @@
+<launch>
+  <!--
+    Runs the VisTSP experiments (global_plan steps 3-4).
+
+    Each trial samples `targets_per_trial` target spheres from the workspace
+    regions. Regions are drawn WITH REPETITION, so a trial may contain
+    overlapping targets, which are the trials that exercise node splitting.
+    Every method under test then solves the SAME pre-generated problem set, so
+    the comparison is paired.
+
+    Results go to results_prefix.txt (human readable) and results_prefix.csv
+    (one row per method, trial and rule; plot from that one).
+
+    The methods are listed in the runner's run(), not here: they set parameters
+    on the node themselves, because a method is a combination of planner mode,
+    coverage k and base locality rather than a single value.
+  -->
+
+  <arg name="num_trials" default="20"/>
+  <arg name="targets_per_trial" default="5"/>
+  <!-- Fixed by default so the problem set is reproducible across invocations.
+       Change it deliberately to draw a different set. -->
+  <arg name="rng_seed" default="20260909"/>
+  <arg name="publish_markers" default="true"/>
+  <!-- Empty means take the frame from the robot model, which is the planning
+       frame the collision objects are expressed in. Override only if wrong. -->
+  <arg name="marker_frame" default=""/>
+  <arg name="results_prefix" default="vistsp_experiments"/>
+  <arg name="sampling_regions_file"
+       default="$(find visual_based_planning)/config/sampling_regions_double_room.yaml"/>
+
+  <node name="visual_planning_node" pkg="visual_based_planning"
+        type="visual_planning_node" output="screen">
+      <rosparam command="load"
+                file="$(find visual_based_planning)/config/planner_config.yaml"/>
+  </node>
+
+  <node name="vistsp_experiment_runner" pkg="visual_based_planning"
+        type="vistsp_experiment_runner" output="screen">
+      <param name="num_trials"            value="$(arg num_trials)"/>
+      <param name="targets_per_trial"     value="$(arg targets_per_trial)"/>
+      <param name="rng_seed"              value="$(arg rng_seed)"/>
+      <param name="publish_markers"       value="$(arg publish_markers)"/>
+      <param name="marker_frame"          value="$(arg marker_frame)"/>
+      <param name="results_prefix"        value="$(arg results_prefix)"/>
+      <param name="sampling_regions_file" value="$(arg sampling_regions_file)"/>
+  </node>
+</launch>

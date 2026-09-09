@@ -6,7 +6,9 @@
 
 // Include your headers
 #include "visual_based_planning/planners/PlannerFactory.h"
+#include "visual_based_planning/planners/LocalVisTSP.h"
 #include "visual_based_planning/PlanVisibilityPath.h"
+#include "visual_based_planning/PlanVisibilityTour.h"
 #include <trajectory_msgs/JointTrajectory.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 #include "../include/visual_based_planning/common/Types.h"
@@ -16,6 +18,11 @@ private:
     ros::NodeHandle nh_;  // Global Namespace ("/")
     ros::NodeHandle pnh_; // Private Namespace ("~")
     ros::ServiceServer service_;
+    /// The VisTSP tour service (global_plan step 4). Separate from service_
+    /// because its result -- per-algorithm costs, stops and leg boundaries --
+    /// does not fit the single-target response, and the single-target path
+    /// serves the TVMP paper and should not change shape for this.
+    ros::ServiceServer tour_service_;
     planning_scene_monitor::PlanningSceneMonitorPtr psm_;
     /// The shared world. Outlives individual planners so that swapping algorithms does
     /// not rebuild the visibility structures.
@@ -42,6 +49,23 @@ private:
     visual_planner::PRMParams prm_params_;
     int time_cap_;
 
+    // --- VisTSP tour config (planner/vistsp/*), re-read on every tour call ---
+    // These are parameters rather than request fields on purpose: ROS messages
+    // have no optional fields, so an unset bool would arrive as false and
+    // silently switch an algorithm off. Parameters also match how every other
+    // knob in this node works, and experiment_runner.cpp already sets
+    // parameters before calling, so sweeps need no new machinery.
+    bool vistsp_use_nearest_;
+    bool vistsp_use_farthest_;
+    bool vistsp_use_cheapest_;
+    bool vistsp_use_two_opt_;
+    int  vistsp_coverage_;
+    /// Radius in metres the base is confined to, measured from the start
+    /// configuration. <= 0 means UNCONSTRAINED, which runs the same pipeline
+    /// over the whole environment -- the intended VisCfgTSP baseline, not a
+    /// misconfiguration.
+    double vistsp_base_locality_radius_;
+
 public:
     VisualPlanningNode(planning_scene_monitor::PlanningSceneMonitorPtr psm)
         : psm_(psm), pnh_("~"), params_changed_(false), planner_dirty_(false)
@@ -59,6 +83,12 @@ public:
         use_visibility_roadmap_ = false;
         current_shortcutting_ = true;
         time_cap_ = 60;
+        vistsp_use_nearest_ = true;
+        vistsp_use_farthest_ = true;
+        vistsp_use_cheapest_ = true;
+        vistsp_use_two_opt_ = true;
+        vistsp_coverage_ = 1;
+        vistsp_base_locality_radius_ = 0.0;
 
         // Load static config (Bounds, Resolution, etc.) into the context and into the
         // retained planner config, then build the planner named by planner/mode.
@@ -71,7 +101,8 @@ public:
 
 
         service_ = nh_.advertiseService("plan_visibility_path", &VisualPlanningNode::planCallback, this);
-        ROS_WARN("Visual Planning Service Ready");
+        tour_service_ = nh_.advertiseService("plan_visibility_tour", &VisualPlanningNode::tourCallback, this);
+        ROS_WARN("Visual Planning Service Ready (plan_visibility_path, plan_visibility_tour)");
     }
 
     /**
@@ -180,6 +211,27 @@ public:
         
         // Pass to planner
         ctx_->setVisibilityIntegrityParams(vi_params);
+
+        loadTourConfig();
+    }
+
+    /**
+     * @brief Loads the planner/vistsp parameters, the VisTSP tour knobs.
+     *
+     * Called from loadStaticConfig() and again at the start of every tour
+     * request, so a sweep can change the algorithm set between calls without
+     * restarting the node. None of these force a planner rebuild: they are read
+     * by LocalVisTSP, or applied to the live planner, not baked in at
+     * construction.
+     */
+    void loadTourConfig() {
+        pnh_.param("planner/vistsp/use_nearest_insertion",  vistsp_use_nearest_,  true);
+        pnh_.param("planner/vistsp/use_farthest_insertion", vistsp_use_farthest_, true);
+        pnh_.param("planner/vistsp/use_cheapest_insertion", vistsp_use_cheapest_, true);
+        pnh_.param("planner/vistsp/use_two_opt",            vistsp_use_two_opt_,  true);
+        pnh_.param("planner/vistsp/coverage",               vistsp_coverage_,     1);
+        pnh_.param("planner/vistsp/base_locality_radius",
+                   vistsp_base_locality_radius_, 0.0);
     }
 
     /**
@@ -302,20 +354,34 @@ public:
         }
     }
 
-    bool planCallback(visual_based_planning::PlanVisibilityPath::Request &req,
-                      visual_based_planning::PlanVisibilityPath::Response &res) {
-        
+    /**
+     * @brief Setup shared by both service callbacks: refresh parameters, resolve
+     *        the mode, re-initialise the context if stale, swap the planner if
+     *        needed.
+     *
+     * Extracted when the tour service was added (2026-09-09). Behaviour is
+     * unchanged; the point is that two service handlers must not each carry
+     * their own copy of this sequence, because the copies would drift and one
+     * service would quietly plan with stale parameters.
+     *
+     * @param requested_mode Overrides planner/mode for this call only; may be empty.
+     * @param ls             The caller's scene lock, held for the whole request.
+     * @param mode_out       Receives the mode actually used.
+     * @return false if the requested mode names no known planner.
+     */
+    bool preparePlanner(const std::string& requested_mode,
+                        planning_scene_monitor::LockedPlanningSceneRO& ls,
+                        std::string& mode_out) {
         // 1. Check for param updates
         updatePlannerParams();
 
         // 2. Determine Mode. The request overrides the parameter server for this call
         // only, so the mode is resolved before the planner is chosen.
-        std::string mode = current_mode_;
-        if (!req.planner_type.empty()) {
-             mode = req.planner_type;
+        mode_out = current_mode_;
+        if (!requested_mode.empty()) {
+            mode_out = requested_mode;
         }
 
-        planning_scene_monitor::LockedPlanningSceneRO ls(psm_);
         planning_scene::PlanningScenePtr fresh_scene;
 
         // 3. Rebuild the shared context if it is stale. This is the expensive path: it
@@ -336,28 +402,49 @@ public:
 
         // 4. Swap the planner if the requested mode differs from the one we built, or
         // if a construction-time parameter changed. The context is untouched.
-        if (planner_dirty_ || mode != built_mode_) {
+        if (planner_dirty_ || mode_out != built_mode_) {
             if (!fresh_scene) fresh_scene = ls->diff();
-            if (!rebuildPlanner(fresh_scene, mode)) {
+            if (!rebuildPlanner(fresh_scene, mode_out)) {
                 ROS_ERROR("Requested planner '%s' is unknown; failing this request.",
-                          mode.c_str());
-                res.success = false;
-                return true;
+                          mode_out.c_str());
+                return false;
             }
         }
+        return true;
+    }
 
-        // 5. Pass Targets. Done after any rebuild -- the target and start configuration
-        // are per-run state and would not survive one.
-        planner_->computeTargetMES(req.task.target_points);
-
-        if (!req.task.start_joints.empty()) {
-            planner_->setStartJoints(req.task.start_joints);
+    /**
+     * @brief Applies the request's start joints, or the robot's current state.
+     *
+     * Must run AFTER any planner rebuild: the start configuration is per-run
+     * state and would not survive one.
+     */
+    void applyStartJoints(const std::vector<double>& requested,
+                          planning_scene_monitor::LockedPlanningSceneRO& ls) {
+        if (!requested.empty()) {
+            planner_->setStartJoints(requested);
         } else {
             std::vector<double> current_joints;
             std::string group = planner_->getGroupName();
             ls->getCurrentState().copyJointGroupPositions(group, current_joints);
             planner_->setStartJoints(current_joints);
         }
+    }
+
+    bool planCallback(visual_based_planning::PlanVisibilityPath::Request &req,
+                      visual_based_planning::PlanVisibilityPath::Response &res) {
+
+        planning_scene_monitor::LockedPlanningSceneRO ls(psm_);
+        std::string mode;
+        if (!preparePlanner(req.planner_type, ls, mode)) {
+            res.success = false;
+            return true;
+        }
+
+        // 5. Pass Targets. Done after any rebuild -- the target and start configuration
+        // are per-run state and would not survive one.
+        planner_->computeTargetMES(req.task.target_points);
+        applyStartJoints(req.task.start_joints, ls);
 
         ROS_WARN("Executing Planner with Mode: %s", mode.c_str());
 
@@ -378,6 +465,144 @@ public:
         } else {
             ROS_WARN("Planner failed to find a solution.");
         }
+        return true;
+    }
+
+    /**
+     * @brief Plans a visibility tour over several targets (global_plan step 4).
+     *
+     * Runs planners/LocalVisTSP.h: a multi-target coverage query, then the
+     * enabled E-GTSP insertion rules, each optionally improved by 2-opt, then
+     * the cheapest tour expanded into a trajectory and smoothed per leg.
+     *
+     * WHAT vs HOW. The request says what to solve -- the targets, the start,
+     * the planner. How to solve it comes from the planner/vistsp parameters,
+     * reloaded here
+     * on every call so a sweep can change the algorithm set between requests
+     * without restarting the node.
+     *
+     * LOCAL OR GLOBAL. planner/vistsp/base_locality_radius <= 0 leaves the base
+     * unconstrained and tours the whole environment. That is the intended
+     * baseline (the VisCfgTSP benchmark), so it is logged as a deliberate mode
+     * rather than treated as a missing setting.
+     */
+    bool tourCallback(visual_based_planning::PlanVisibilityTour::Request &req,
+                      visual_based_planning::PlanVisibilityTour::Response &res) {
+        res.success = false;
+        res.best = -1;
+        res.coverage_incomplete = false;
+
+        if (req.targets.empty()) {
+            ROS_ERROR("Tour request carries no targets; refusing. VisTSP needs the "
+                      "targets named individually, unlike the single-target service "
+                      "which collapses a point cloud into one sphere.");
+            return true;
+        }
+
+        loadTourConfig();
+
+        planning_scene_monitor::LockedPlanningSceneRO ls(psm_);
+        std::string mode;
+        if (!preparePlanner(req.planner_type, ls, mode)) {
+            return true;
+        }
+
+        // --- per-run state, applied after any planner rebuild ---------------
+        std::vector<visual_planner::Ball> targets;
+        std::vector<geometry_msgs::Point> centers;
+        targets.reserve(req.targets.size());
+        centers.reserve(req.targets.size());
+        for (const auto& t : req.targets) {
+            visual_planner::Ball ball;
+            ball.center = Eigen::Vector3d(t.center.x, t.center.y, t.center.z);
+            ball.radius = t.radius;
+            targets.push_back(ball);
+            centers.push_back(t.center);
+        }
+        planner_->setTargets(targets);
+
+        // The coverage query works off setTargets(), but several planner
+        // helpers still read target_mes_. Set it to a sphere enclosing every
+        // target centre so it is not left at whatever a previous single-target
+        // request happened to leave behind.
+        planner_->computeTargetMES(centers);
+
+        planner_->setCoverage(vistsp_coverage_);
+        if (vistsp_base_locality_radius_ > 0.0) {
+            planner_->setBaseLocality(vistsp_base_locality_radius_);
+            ROS_WARN("Tour: LOCAL run, base confined to %.2f m of the start.",
+                     vistsp_base_locality_radius_);
+        } else {
+            planner_->clearBaseLocality();
+            ROS_WARN("Tour: GLOBAL run, base unconstrained (the VisCfgTSP baseline).");
+        }
+
+        applyStartJoints(req.start_joints, ls);
+
+        // --- solve -----------------------------------------------------------
+        visual_planner::LocalVisTSP solver(*planner_);
+        solver.setUseNearestInsertion(vistsp_use_nearest_);
+        solver.setUseFarthestInsertion(vistsp_use_farthest_);
+        solver.setUseCheapestInsertion(vistsp_use_cheapest_);
+        solver.setUseTwoOpt(vistsp_use_two_opt_);
+
+        ROS_WARN("Executing VisTSP tour with Mode: %s over %lu targets "
+                 "(nearest=%d farthest=%d cheapest=%d two_opt=%d, coverage=%d)",
+                 mode.c_str(), req.targets.size(),
+                 vistsp_use_nearest_, vistsp_use_farthest_,
+                 vistsp_use_cheapest_, vistsp_use_two_opt_, vistsp_coverage_);
+
+        const bool success = solver.solve();
+        const visual_planner::LocalVisTSPResult& result = solver.getResult();
+
+        res.coverage_incomplete = result.coverage_incomplete;
+        res.coverage_seconds = result.coverage_seconds;
+        res.instance_seconds = result.instance_seconds;
+        res.gtsp_seconds     = result.gtsp_seconds;
+        res.expand_seconds   = result.expand_seconds;
+        res.total_seconds    = result.total_seconds;
+
+        // The per-rule costs are reported whether or not a tour came out: a
+        // failure after some rules succeeded is still informative.
+        for (const auto& run : result.runs) {
+            res.algorithm_names.push_back(run.name);
+            res.construction_costs.push_back(run.construction_cost);
+            res.improved_costs.push_back(run.improved_cost);
+        }
+        res.best = result.best;
+
+        if (!success) {
+            ROS_WARN("VisTSP tour failed.");
+            return true;
+        }
+
+        // --- fill the trajectory, the same conversion planCallback uses ------
+        const moveit::core::JointModelGroup* jmg =
+            ls->getRobotModel()->getJointModelGroup(planner_->getGroupName());
+        res.trajectory.joint_names = jmg->getActiveJointModelNames();
+        for (const auto& conf : result.path) {
+            trajectory_msgs::JointTrajectoryPoint point;
+            point.positions = conf;
+            res.trajectory.points.push_back(point);
+        }
+
+        // Stops and the target each one observes, so a client can draw which
+        // configuration is watching what.
+        for (size_t i = 0; i < result.stop_indices.size(); ++i) {
+            res.stop_indices.push_back(result.stop_indices[i]);
+            const int stop_node = (i < result.runs[result.best].tour.stops.size())
+                                ? result.runs[result.best].tour.stops[i] : -1;
+            res.stop_target.push_back(
+                (stop_node >= 0 &&
+                 stop_node < static_cast<int>(result.instance.node_target.size()))
+                    ? result.instance.node_target[stop_node] : -1);
+        }
+
+        res.success = true;
+        ROS_WARN("VisTSP tour: %s won with cost %.4f over %lu waypoints and %lu stops.",
+                 result.runs[result.best].name,
+                 result.runs[result.best].improved_cost,
+                 result.path.size(), result.stop_indices.size());
         return true;
     }
 };

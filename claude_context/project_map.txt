@@ -1,6 +1,20 @@
 PROJECT MAP
 ===========
-Last updated: 2026-08-30 (multi-target coverage queries; global_plan step 2)
+Last updated: 2026-09-09 (step-3 design fully settled -- O3 resolved as D6:
+              RP1's independence condition became an enumeration bound,
+              s_min = 3, with no runtime guard; 6.1's non-adjacent duplicate
+              copies accepted as-is; only O1/O2 remain open; D7 adds a
+              randomized 2-opt scan order behind a fixed seed. FIRST STEP-3
+              CODE WRITTEN and step 3 now code-complete except 6.2:
+              algorithms/GTSP.h (four heuristics, index-only),
+              GraphManager::metricClosure()/closurePath(),
+              VisibilityPlannerBase::getRoot(), planners/CoverageTour.h
+              (splitting + expansion), planners/LocalVisTSP.h (step 4, the
+              composition), the plan_visibility_tour service + tour client, and
+              src/vistsp_experiment_runner.cpp. ALL SYNTAX-CHECKED, NONE EVER
+              RUN -- catkin build has not been run either, so the new message
+              headers do not exist in devel/ yet. Next session: build, run an
+              experiment, expect to debug.)
 
 PURPOSE OF THIS FILE
 --------------------
@@ -30,7 +44,8 @@ The material falls into three groups:
 
   (B) Design notes (plain text, in claude_context/) for the next stage,
       Visibility TSP (VisTSP): observing MANY targets with the mobile
-      manipulator.
+      manipulator -- now including the reference material and implementation
+      plan for the GTSP heuristics of step 3.
 
   (C) The ROS package -- this repository. It implements Group A (the TVMP paper:
       VI-tree, VisIK, VisPRM, VisRRT, plus the VIR baseline) and its experiment
@@ -84,11 +99,15 @@ DIRECTORY TREE
     package.xml
     readme.txt                   operational runbook (robot bring-up etc.)
     planner_experiments_results.txt   (tracked; currently DELETED in working tree)
-    claude_context/              paper sections + VisTSP notes + this map
-    config/                      YAML parameters
+    claude_context/              paper sections + VisTSP notes + GTSP sources
+                                 and plan + this map
+    config/                      YAML parameters (planner_config.yaml,
+                                 targets.yaml, vistsp_targets.yaml, ...)
     include/visual_based_planning/
         planners/    PlanningContext.h  VisibilityPlannerBase.h
                      VisRRTPlanner.h  VisPRMPlanner.h  PlannerFactory.h
+                     CoverageTour.h  LocalVisTSP.h
+        algorithms/  GTSP.h
         common/Types.h
         components/  Sampler.h  ValidityChecker.h  VisualIK.h
                      PathSmoother.h  PathExecuter.h
@@ -96,8 +115,11 @@ DIRECTORY TREE
                           VisibilityIntegrity.h  VisibilityRoadmap.h
                           Graph.h  NearestNeighbor.h  nanoflann.hpp
     launch/                      visual_planner.launch  visual_ik_client.launch
-    msg/                         VisibilityTask.msg
-    srv/                         PlanVisibilityPath.srv  VisualIK.srv
+                                 visual_planning_tour.launch
+                                 vistsp_experiments.launch
+    msg/                         VisibilityTask.msg  VisibilityTarget.msg
+    srv/                         PlanVisibilityPath.srv  PlanVisibilityTour.srv
+                                 VisualIK.srv
     src/                         ROS nodes + CUDA
 
 
@@ -231,6 +253,124 @@ srv/VisualIK.srv
   Contents: Request {Point[] target_points} ->
     Response {Pose best_pose; bool success; string message}.
 
+src/vistsp_experiment_runner.cpp  (~800 lines, NEW 2026-09-09)
+  Role: Experiment driver for the VisTSP additions (global_plan steps 3-4).
+    Samples target spheres from the workspace regions, then evaluates one or
+    more tour METHODS on the same problem set.
+  Significance: this is where the "what do the extra layers buy" comparison
+    will be measured. src/experiment_runner.cpp (the TVMP paper's driver) is
+    left untouched.
+  Kept from experiment_runner.cpp, deliberately: problems are PRE-GENERATED
+    ONCE and reused by every method, which is what makes the comparison PAIRED
+    and therefore meaningful; region sampling; radius = shortest distance to the
+    region bounds; rejecting a sphere that intersects a scene obstacle; params
+    set between configurations with a settle; the stats block.
+  Changed: a TRIAL IS A SET OF M TARGETS, not one. Regions are drawn WITH
+    REPETITION within a trial (Stav's spec), so two targets can land in one
+    region and may OVERLAP -- flagged in TourProblem::has_overlap and carried
+    into the CSV rather than prevented, because an overlap is exactly the case
+    where one configuration sees two targets and is therefore what exercises
+    node splitting (D3) and RP1's candidate sets. No point clouds are sampled:
+    the tour service takes spheres directly. room_flags_ is gone -- "which
+    room" is not one bit when a trial has M targets -- replaced by the per-
+    target region_id.
+  NO CONFIG PER INSERTION RULE, AND NONE FOR 2-OPT ON/OFF. One tour call
+    returns every enabled rule's cost before AND after 2-opt, so a row per rule
+    would re-run the expensive coverage query to learn what one call already
+    reports. Configurations vary only what genuinely needs a separate run: the
+    planner mode, the coverage k, and base locality.
+  HOW GlobalVisTSP PLUGS IN (Stav asked for this explicitly): TourProblem and
+    TrialOutcome mention no method, and the stats, printing and file output
+    touch only TrialOutcome. Exactly ONE function is method-specific,
+    callMethod(). Adding GlobalVisTSP is one more MethodConfig row plus one
+    branch there -- generation and reporting do not change, and both methods
+    are then automatically compared on the same problem set.
+  Markers: behind ~publish_markers (default true). A translucent SPHERE at each
+    target's true radius plus a TEXT label with the target INDEX -- the labels
+    matter because the response's stop_target refers to those indices, so
+    without them a tour cannot be read off the screen. A DELETEALL is sent
+    first so the previous trial's markers are not mistaken for this one's.
+  Gotcha: the marker frame comes from the ROBOT MODEL
+    (RobotModelLoader::getModel()->getModelFrame()), which is the planning
+    frame the collision objects are expressed in. PlanningSceneInterface has NO
+    getPlanningFrame() in Melodic -- assuming it did was a compile error. If the
+    model cannot be loaded the runner DISABLES markers rather than guessing a
+    frame, since markers in the wrong frame would put the targets somewhere
+    else and misrepresent the problem.
+  Output: <results_prefix>.txt (human readable, per-phase timing and cost) and
+    .csv (one row per method/trial/rule, including has_overlap -- plot from
+    this one).
+  ~rng_seed defaults to a FIXED value so the problem set is reproducible across
+    invocations, not just within one run.
+  Status: written and syntax-checked; NOT yet run.
+
+src/visual_planning_tour_client.cpp  (~250 lines, NEW 2026-09-09)
+  Role: Client for the plan_visibility_tour service. Reads targets from the
+    YAML named by its `targets_yaml` param, calls the service, and prints the
+    per-algorithm cost table.
+  Significance: THE PLACE CLOUD-TO-SPHERE CONVERSION HAPPENS. See the target
+    representation note below.
+  Accepts three YAML shapes, in this order: `targets` (spheres with an explicit
+    centre and radius), `target_clouds` (one point cloud PER target, each
+    reduced by enclosingBall()), and `target_points` (the legacy single-target
+    cloud, collapsed to ONE sphere -- it WARNS when it takes this path, since a
+    tour over one target has a single stop and anyone who pointed it at
+    config/targets.yaml needs to know).
+  Does NOT send the algorithm flags: those are planner/vistsp parameters on the
+    node, so that an unset message field cannot silently disable an algorithm.
+  Prints construction cost, post-2-opt cost and the percentage gain per rule,
+    marking the winner -- which is the comparison the four flags exist for.
+  Launched by launch/visual_planning_tour.launch, which also exposes the six
+    planner/vistsp knobs as roslaunch args (base_locality:=0.0 is the global
+    baseline run).
+
+TARGET REPRESENTATIONS -- WHY THERE IS NO "cloud OR sphere" SPLIT IN THE MSGS
+  Asked by Stav on 2026-09-09: should target_point_cloud and target_sphere be
+  two different structures, propagated through the .msg files and params?
+  ANSWER TAKEN: no, because they are not alternatives -- the SPHERE IS DERIVED
+  FROM THE CLOUD. Everything below the service already speaks spheres
+  (targets_ is std::vector<Ball>, the oracle takes a centre and radius), so the
+  sphere is the canonical form and a cloud is an INPUT FORMAT.
+  What was done instead:
+    * the conversion was extracted into ONE function, enclosingBall() in
+      common/Types.h, which computeTargetMES() now calls -- so the planner and
+      any client cannot disagree about what sphere a cloud means;
+    * PlanVisibilityTour.srv carries spheres only, and clouds are handled at
+      the input boundary (the tour client);
+    * VisibilityTask.msg and PlanVisibilityPath.srv were NOT TOUCHED, which is
+      what guarantees the single-target visibility path cannot break.
+  Why the two-structure version was rejected: there are ALREADY two internal
+  sources of truth for the target -- targets_ (the coverage query) and
+  target_mes_ (several planner helpers) -- and tourCallback() has to set both
+  to keep them consistent. Adding two message types would make it three places
+  that can disagree, and every consumer would need a rule for "what if both are
+  set". The fix direction is to reduce that count, not raise it.
+  enclosingBall() is NOT a true minimum enclosing sphere -- it is centred on
+  the centroid, exactly as computeTargetMES() always was. Kept deliberately:
+  every visibility result in the repo was produced with that definition.
+
+msg/VisibilityTarget.msg  +  srv/PlanVisibilityTour.srv   (NEW 2026-09-09)
+  Role: The ROS contract for a VisTSP tour (global_plan step 4).
+  Why a SEPARATE service rather than extending PlanVisibilityPath: the tour's
+    result -- per-algorithm costs, stop indices, which target each stop
+    observes -- does not fit the single-target response, and the single-target
+    path serves the TVMP paper and should not change shape for this. Decision
+    by Stav, 2026-09-09.
+  Why a separate MESSAGE for targets: VisibilityTask carries target_points, a
+    point cloud that computeTargetMES() collapses into ONE enclosing sphere.
+    VisTSP needs the targets kept apart, since each ball is its own GTSP
+    cluster, so VisibilityTarget names a centre and radius per target.
+  WHAT vs HOW: the request says what to solve (targets, start joints, planner
+    type). How to solve it comes from the planner/vistsp parameters. Stav chose
+    parameters over request fields (2026-09-09) because ROS messages have no
+    optional fields -- an unset bool arrives as false, so a client that forgot
+    them would silently disable all three insertion rules and get a refusal.
+    Parameters also match every other knob in the node and need no new
+    machinery in experiment_runner, which already sets params before calling.
+  Response also carries stop_indices (the leg boundaries, so a client can
+    smooth or draw per leg) and stop_target (-1 for the start configuration),
+    plus coverage_incomplete, which is NOT a failure: a tour needs one
+    reachable configuration per target, so a coverage deficit is still tourable.
 
 --- launch/ -----------------------------------------------------------------
 
@@ -416,6 +556,172 @@ planners/PlannerFactory.h  (~67 lines)
     else, which callers treat as fatal rather than falling back.
   Gotcha: the old node dispatched on `mode.find("PRM") != npos`, so unrecognised
     strings silently ran VisRRT. Matching is now exact.
+
+algorithms/GTSP.h  (~915 lines, NEW 2026-09-09)
+  Role: The four E-GTSP heuristics of global_plan step 3 -- nearest, farthest
+    and cheapest insertion, plus a 2-opt improvement pass in both the
+    fixed-node form (plan 2.5a) and the generalized RP1 form (2.5b).
+  Significance: INDEX-ONLY BY DESIGN. It sees a cost matrix, one cluster label
+    per node and a depot, and knows nothing about roadmaps, configurations,
+    visibility or targets. That is what lets step 6 reuse it unchanged, and it
+    is why node splitting (D3) lives in the CoverageTour adapter instead of
+    here. It has no dependency on Graph.h or any planner type -- <vector>,
+    <limits>, <algorithm>, <cmath>, <iostream> only.
+  Contents: GTSPInstance (cost, cluster, clusters, depot, closed);
+    GTSPTour (stops, cost, feasible, unserved); InsertionRule enum;
+    kGTSPEpsilon, kGTSPRandomizePairOrder, kGTSPPairOrderSeed;
+    insertionTour(), twoOpt(), validateTour(), tourCost();
+    and a gtsp_detail namespace holding insertionCost(),
+    bestInsertionForNode/InCluster(), clusterToTourDistance(), checkInstance(),
+    and bestEndpointPair() (RP1's three-term minimisation).
+  Why one skeleton: the three insertion rules differ ONLY in the selection step
+    and share an identical insertion step, so insertionTour() is a single
+    function switched on InsertionRule, exactly as both source documents
+    present them. Cheapest has no separate selection at all (plan 2.3).
+  Coverage is structural: because the clusters partition the nodes and a tour
+    holds one node per cluster, there is NO coverage bookkeeping in this file --
+    no uncovered set, no bitmask, no re-validation after a 2-opt move or an RP1
+    substitution. checkInstance() verifies the D3 partition rather than
+    trusting the builder, since every argument above depends on it.
+  The 2-opt enumeration is D6: a plain pair loop over the two removed edges
+    (p < q), keeping only pairs whose CYCLIC SEPARATION
+    s = min(q-p, |T|-(q-p)) is at least s_min (2 for the fixed-node variant,
+    3 for RP1). That separation test IS the correctness condition -- there is
+    no runtime guard and no fallback path, and the header says so at length so
+    neither gets re-added.
+  Why the pair loop rather than a bounded reversed-segment length (Stav,
+    2026-09-09): it visits every move exactly once, the segment T[p+1..q] is
+    contiguous so the reversal is a plain std::reverse, and index 0 never
+    falls inside it. The L-bounded form double-visited moves when |T| is even
+    and needed cyclic reversal plus a per-move depot rotation to compensate.
+  D7, randomized scan order: the admissible pairs go into a vector that is
+    shuffled once per pass, behind the hardcoded kGTSPRandomizePairOrder. Both
+    2-opt variants are FIRST-improvement, so the local optimum depends on visit
+    order and lexicographic order biases it toward the low-index stops. Order
+    cannot affect correctness -- strict decrease per move is untouched. The
+    seed is FIXED (kGTSPPairOrderSeed) on purpose: a clock- or
+    random_device-seeded shuffle would reintroduce exactly what plan 5.2 exists
+    to prevent, non-reproducible tours that make comparing the four algorithms
+    meaningless. Vary the seed deliberately for restarts and record it. This
+    does NOT replace 5.2's tie-breaking, and it touches 2-opt only -- the three
+    insertion constructions stay deterministic greedy.
+  Note: stops[0] == depot is a post-condition this file gets for free, NOT
+    something the algorithms need -- a cycle has no start and the depot is
+    pinned by its singleton cluster. expandTour() (6.1) is the only place a
+    real start exists, so any rotation belongs there.
+  Gotcha: the cost matrix is a PSEUDOmetric under D3 -- distinct nodes at
+    distance 0 -- so every argmin breaks ties deterministically by lowest node
+    then lowest position index (plan 5.2), and 2-opt accepts only
+    gain > kGTSPEpsilon, never >= 0 (5.1). Without the first the four
+    algorithms return different tours on different runs over the same instance;
+    without the second the local search cycles forever.
+  Fails loudly, never quietly: an open path (closed == false) is refused as
+    undesigned, a broken cluster partition is refused, an unreachable cluster
+    is named in GTSPTour::unserved with feasible == false, and twoOpt() will
+    not improve an infeasible tour.
+  Status: written and syntax-checked (g++ -fsyntax-only -std=c++14 -Wall
+    -Wextra, clean, both standalone and as an include); NOT yet run or tested -- per the plan's sec. 7 policy,
+    anything past a compile check must be proposed first.
+
+planners/CoverageTour.h  (~330 lines, NEW 2026-09-09)
+  Role: The adapter between a finished coverage query and algorithms/GTSP.h.
+    buildCoverageTourInstance() builds the E-GTSP instance; expandTour() reads
+    a solved tour back as joint-space waypoints.
+  Significance: THE ONLY PLACE NODE SPLITTING (D3) EXISTS. It sits between two
+    layers that must not know about it -- GraphManager, because a zero-weight
+    edge between two distinct configurations would be a lie about the robot and
+    VisPRM/VisRRT plan on that graph; and GTSP.h, because it must stay
+    index-only for step 6 to reuse it. node_vertex is the indirection that
+    keeps both true, and it is also what makes tour expansion a table lookup
+    instead of a search.
+  Contents: CoverageTourParams (split_shared_nodes); CoverageTourInstance
+    (gtsp, closure, node_vertex, node_target, cluster_target);
+    buildCoverageTourInstance(); expandTour().
+  Three index spaces meet here and the header says so explicitly: VertexDesc,
+    closure index (a physical vertex), and gtsp node index (a (vertex, target)
+    pair). Several gtsp nodes share one closure index -- that IS splitting.
+  Build order: the closure is computed over the distinct physical vertices with
+    the DEPOT FIRST, so closure row 0 doubles as the reachability test for 1.5
+    -- unreachable credited goals are dropped for free out of a sweep that runs
+    anyway, with no inSameComponent() call and no access to planner internals.
+    Empty clusters are then checked BEFORE the instance is assembled, so a
+    starved target is named as a target rather than as a cluster index (1.6).
+  Cluster numbering: cluster 0 is the depot's singleton (1.3), cluster t+1
+    serves target t. cluster_target[] carries that back so failures read in the
+    caller's terms.
+  expandTour() collapses runs of ADJACENT split copies to one waypoint -- the
+    only place splitting is undone. Non-adjacent copies of one vertex stay as
+    two real visits, accepted deliberately (see the GTSP.h entry and plan 6.1).
+  Gotcha: expandTour() does NOT smooth, on purpose. PathSmoother::smoothPath()
+    shortcuts across ALL waypoint pairs, so run on a whole tour it cuts past
+    the observation configurations the tour exists to visit. It takes an
+    optional stop_indices out-param giving the leg boundaries, WITHOUT WHICH
+    smoothing per leg is impossible -- the concatenation otherwise loses which
+    waypoints were stops. That parameter is an addition to the plan's sec. 3.3
+    signature (2026-09-09), made because 6.1 requires per-leg smoothing and the
+    specified signature could not express it.
+  Fails loudly: split_shared_nodes == false is refused as undesigned (O1), as
+    are an empty target list, a root not in the graph (which catches the
+    (VertexDesc)(-1) a planner reports before it has run), a goal vertex not in
+    the graph, and any target with no reachable configuration. checkInstance()
+    from GTSP.h is run on the assembled instance before returning.
+  Status: written and syntax-checked (g++ -fsyntax-only -std=c++14 -Wall
+    -Wextra, no errors; the only warnings come from MoveIt and the
+    pre-existing VisibilityOracle.h); NOT yet run or tested.
+
+planners/LocalVisTSP.h  (~300 lines, NEW 2026-09-09)
+  Role: global_plan step 4. Drives step 2's coverage query and step 3's GTSP
+    heuristics end to end: targets in, motion plan out.
+  Significance: NO NEW ALGORITHM. It is the composition of 2 + 3, which is what
+    the map's step table always said step 4 was. The sketch in
+    local_VisTSP.txt ("G <- LocalVisRRG; GreekTSP(G)") is superseded in both
+    halves -- VisRRG dropped 2026-08-26, Greek TSP replaced by the GTSP
+    heuristics -- but the composition it described is exactly this.
+  "LOCAL" IS A KNOB, NOT A PRECONDITION. Nothing here requires a confined base.
+    setBaseLocality(delta) on the PLANNER is what makes a run local; leaving it
+    unset runs the same pipeline over the whole environment. BOTH are intended
+    uses (Stav, 2026-09-09): local as the per-location unit steps 5-6 will call
+    once per base location, and GLOBAL as the BASELINE for the whole
+    environment -- the "VisCfgTSP" benchmark of VisTSP_frameworks.txt, whose
+    purpose is to measure what the elaborate algorithm's extra layers buy. So
+    no code here may assume locality_.enabled.
+  Configuration boundary: targets, coverage k, start joints and base locality
+    are set ON THE PLANNER, where those setters already live -- duplicating
+    them here would be a second source of truth. This class owns only the
+    tour-side choices.
+  Contents: LocalVisTSPRun (per-rule outcome: construction_cost AND
+    improved_cost, two_opt_ran/improved, the tour); LocalVisTSPResult (runs,
+    best, path, stop_indices, instance, coverage_incomplete); class LocalVisTSP
+    with setUse{Nearest,Farthest,Cheapest}Insertion() / setUseTwoOpt() plus
+    getters, setTourParams(), getResult(), solve().
+  The four flags are Stav's spec (2026-09-09): one per insertion rule, one for
+    2-opt. When 2-opt is on it runs on EVERY enabled rule, not just the winner,
+    because "nearest + 2-opt vs farthest + 2-opt" is the comparison wanted and
+    it cannot be recovered from a single improved tour. Both costs are stored
+    per rule for the same reason. All four default true -- the rules share one
+    metric closure, so all three cost barely more than one (plan sec. 4).
+  Partial coverage is NOT a failure: planCoverage() returns false when a target
+    missed coverage k, but a tour needs only ONE reachable configuration per
+    target, so a deficit is still tourable. It is recorded in
+    coverage_incomplete and the run continues; the real failure -- a target
+    with NO reachable configuration -- is named by buildCoverageTourInstance()
+    (plan 1.6).
+  Smoothing is PER LEG with stops pinned, gated on the planner's existing
+    shortcutting_ flag (a getShortcutting() accessor was added for this rather
+    than a duplicate knob). smoothPath() reconstructs from the last index back
+    to the first, so it always preserves both endpoints of what it is handed --
+    which is what makes per-leg pinning sound. Collapsed runs of split copies
+    give two equal consecutive stop indices, an empty leg that is skipped, so a
+    configuration serving several targets is pinned once and serves them all.
+  Wired into the node 2026-09-09 as the plan_visibility_tour service; see the
+    visual_planning_node.cpp entry. result.path has the same shape as
+    VisibilityPlannerBase::getResultPath(), so it goes through the same
+    JointTrajectory conversion.
+  Gotcha: 2-opt runs the generalized RP1 form (D5). twoOpt()'s fixed-node
+    variant (plan 2.5a) is implemented and reachable but not wired to a flag;
+    a fifth flag would expose that ablation if it is ever wanted.
+  Status: written and syntax-checked (no errors, no warnings from the new
+    files); NOT yet run.
 
 components/ValidityChecker.h
   Role: All collision and metric primitives.
@@ -652,6 +958,31 @@ data_structures/Graph.h
     (prints the k largest with a representative config); exportCCMap() (writes
     cc_map.txt: id, joint values, connected-component id -- for offline analysis
     of why PRM failed to connect); printVertexDegrees.
+    ADDED 2026-09-09 for step 3: struct SubsetClosure (nodes, cost,
+    predecessor) plus metricClosure() and closurePath().
+  metricClosure(subset) runs ONE Dijkstra per subset vertex and KEEPS both the
+    distance and predecessor maps. It exists because shortestPath() throws
+    those maps away after extracting a single path, so a double loop over it
+    would run n^2 Dijkstras to recover what n already contain -- and still
+    could not answer a second pair from the same source. The retained
+    predecessor maps are also exactly what CoverageTour's expandTour() walks.
+    It operates on PHYSICAL vertices only and never sees a split node or a
+    zero-weight glue edge.
+  Gotcha, load-bearing: BGL leaves unreached vertices at
+    numeric_limits<double>::max(), which is FINITE. metricClosure() converts
+    those to infinity() because the GTSP layer tests reachability with
+    `x < infinity()` -- passing max() through would make an unreachable pair
+    look like a usable edge of astronomical cost and a tour would be built
+    through it and reported feasible. That conversion is the only thing
+    preventing it. Note shortestPath() uses the max() comparison directly, so
+    the two functions spell the same test differently on purpose.
+  metricClosure() rejects a subset containing a duplicate vertex: it would
+    create a zero-cost pair between two entries that are the same vertex,
+    indistinguishable from -- and corrupting -- D3's split-copy glue.
+  Fixed 2026-09-09: the header used std::iota (in countConnectedComponents)
+    without including <numeric>, so it was not self-contained and only compiled
+    because another header pulled <numeric> in first. Pre-existing; found while
+    syntax-checking this file alone, which plan sec. 7.1 requires.
 
 data_structures/NearestNeighbor.h
   Role: kNN over configurations, with a robot-aware metric.
@@ -676,7 +1007,7 @@ src/visual_planning_node.cpp
   Role: The main ROS service node -- the production entry point.
   Contents: class VisualPlanningNode wraps a PlanningSceneMonitor, one shared
     PlanningContext, and a swappable VisibilityPlannerBase, and advertises
-    "plan_visibility_path".
+    "plan_visibility_path" and, since 2026-09-09, "plan_visibility_tour".
     - loadStaticConfig(): reads every parameter from the PRIVATE namespace
       (planner_config.yaml). Context-level values go straight to ctx_;
       planner-level ones (RRT/PRM params, time cap, snap_fov_on_insert,
@@ -697,6 +1028,25 @@ src/visual_planning_node.cpp
       /planner/use_visibility_roadmap, /planner/enable_shortcutting, planner/mode)
       and sets params_changed_ if any differ. This is the mechanism
       experiment_runner uses to switch algorithms without restarting the node.
+    - preparePlanner(mode, ls, mode_out) + applyStartJoints(): EXTRACTED
+      2026-09-09 when the tour service was added, behaviour unchanged. They hold
+      the setup both callbacks need -- param refresh, mode resolution, context
+      re-init, planner swap, start configuration. Extracted rather than copied
+      because two handlers each carrying their own copy would drift and one
+      service would quietly plan with stale parameters.
+    - loadTourConfig(): reads the planner/vistsp parameters (the four algorithm
+      flags, coverage, base_locality_radius). Called from loadStaticConfig() and
+      AGAIN at the top of every tour request, so a sweep can change the
+      algorithm set between calls without restarting the node. None of them
+      forces a planner rebuild.
+    - tourCallback(): the VisTSP entry point (global_plan step 4). Converts the
+      request's target balls, calls setTargets() AND computeTargetMES() over the
+      centres (the coverage query uses setTargets(), but several planner helpers
+      still read target_mes_, which would otherwise hold whatever a previous
+      single-target request left there), applies coverage and locality, then
+      runs LocalVisTSP and fills the response. Reports the per-rule costs even
+      on failure, since a failure after some rules succeeded is still
+      informative.
     - planCallback(): resolves the mode (req.planner_type overrides the param
       server for that call only); if the CONTEXT is uninitialized OR params
       changed, resets the planner and re-snapshots the scene (this is what
@@ -877,6 +1227,22 @@ global_plan.txt
     stays inside the disk anyway). The alternative left on the table is
     whole_robot IK with a disk validity callback on setFromIK: more freedom, but
     it relies on random seed restarts to land inside the disk.
+  RESTATED STEP 3 (Stav, 2026-09-08, and now in the file itself): step 3 is no
+    longer "Greek TSP alg" (MST -> post-order -> shortcut). It reads "Impement
+    GTSP algorithms: 1. Nearest insertion 2. farthest insertion 3. cheapest
+    insertion 4. 2-opt (2 pair local search)". GTSP = Generalized TSP, where
+    the sites to visit are SETS of graph nodes; the sets here are
+    CoverageResult::goals[t], the configurations step 2 found for target t, and
+    the tour picks one node per set. Stav supplied the sources
+    (GTSP_heuristic_algorithms.pdf, three Traveling_Salesman_Problem_*.html).
+    The design was SETTLED on 2026-09-08 and completed on 2026-09-09 with the
+    resolution of its last correctness item (O3 -> D6) -- see
+    GTSP_implementation_plan.txt sec. 8 for the six decisions and the two items
+    still open (O1 split-OFF, O2 the RRT-shortcut scope), neither of which
+    blocks writing the algorithms. The first code is in place:
+    algorithms/GTSP.h holds all four heuristics; planners/CoverageTour.h (the
+    splitting adapter) and GraphManager::metricClosure() are still to write. The MST is gone for good: nothing in the
+    settled design needs one.
 
 1_introduction.tex
   Role: Introduction (\label{sec:intro}).
@@ -966,6 +1332,133 @@ local_VisTSP.txt
     constraint (as a DISK, see below, not the box B), and the GreekTSP half,
     which still consumes a graph plus per-target goal vertices.
 
+GTSP_heuristic_algorithms.pdf
+  Role: Source for global_plan step 3. Two scanned pages (632-633) of "The
+    Traveling Salesman Problem and its Variations", sec. 2.5 "Heuristic
+    algorithms" and the head of sec. 2.6, covering the Fischetti, Salazar and
+    Toth heuristics for GTSP / E-GTSP.
+  Contents: how to adapt farthest insertion (and, "in a similar way", nearest
+    and cheapest insertion) to E-GTSP -- cluster distance
+    d_hk = min{c_ij : i in C_h, j in C_k}; seed from the two mutually farthest
+    clusters; per iteration select the uncovered cluster farthest from the
+    partial tour, then insert the node v of it minimising
+    c_iv + c_vj - c_ij over consecutive tour pairs (i, j). Then two tour
+    IMPROVEMENT procedures: RP1, a generalized 2-opt (and 3-opt) that re-picks
+    which node is used in the clusters at the ends of the changed edges, via
+    two independent 3-term minimisations, O(n^2) over all cluster pairs; and
+    RP2, which finds the OPTIMAL node choice for a FIXED cluster sequence by
+    shortest paths through a layered acyclic network of m+1 layers, and which
+    yields an O((m-1)! n^3) exact algorithm when run over all sequences.
+  Note: E-GTSP is the variant where every cluster is visited EXACTLY once. The
+    scan's OCR is poor -- subscripts and formulas are mangled -- so read the
+    formulas from the plan file's reconstruction rather than from a text dump.
+
+Traveling_Salesman_Problem_nearest_insertion.html
+Traveling_Salesman_Problem_farthest_insertion.html
+Traveling_Salesman_Problem_cheapest_insertion.html
+  Role: Sources for global_plan step 3. Saved pages from Georgia Tech's TSP
+    course notes giving the three PLAIN-TSP insertion heuristics
+    (Rosenkrantz, Stearns and Lewis 1974) that the PDF adapts to E-GTSP.
+  Contents: nearest and farthest insertion as a 5-step selection/insertion
+    loop differing only in min vs. max at the selection step; cheapest
+    insertion, whose first two steps are identical to nearest insertion and
+    which collapses selection and insertion into one global minimisation of
+    c_ir + c_rj - c_ij. Each page also states a worst-case bound and an
+    operation count.
+  Gotcha: those bounds and counts are inline GIFs (IMG000nn_*.GIF) under
+    sibling *_files/ directories that were NOT saved with the pages, so the
+    constants are not recoverable from these files.
+
+GTSP_implementation_plan.txt
+  Role: Implementation plan for global_plan step 3 (the four GTSP algorithms).
+    DESIGN SETTLED 2026-09-08; no code written yet. Read sec. 8 first -- it
+    records Stav's decisions and is the authority on them.
+  THE SIX DECISIONS (sec. 8, restated at the top of the file as D1-D6):
+    D1 the tour is a CYCLE; D2 every run is seeded from the DEPOT (= the start
+    configuration), so the PDF's unrooted "two mutually farthest clusters" seed
+    and the whole d_hk cluster-distance table are dropped; D3 NODE SPLITTING --
+    a configuration seeing several targets becomes one node per target, the
+    copies joined by a ZERO-WEIGHT clique, so the clusters PARTITION the nodes
+    and the problem is textbook E-GTSP; D4 costs are roadmap Dijkstra
+    distances; D5 2-opt is the PDF's generalized RP1 form, which re-picks which
+    node of the cluster is used at the ends of the changed edges; D6 2-opt is
+    enumerated over PAIRS OF REMOVED EDGES (p < q), keeping only those whose
+    CYCLIC SEPARATION s = min(q-p, |T|-(q-p)) is at least s_min -- 2 for the
+    fixed-node variant, 3 for RP1. That is how RP1's independence requirement
+    is enforced: part of the enumeration, not a per-move guard, and no
+    fallback path.
+  WHY D3 IS THE CENTRAL ONE: recordVisibleTargets() credits a vertex to every
+    target it sees, so goals[] as delivered has OVERLAPPING clusters, which
+    textbook E-GTSP forbids. Splitting makes coverage STRUCTURAL (one node per
+    cluster always covers everything, so there is no coverage bookkeeping, no
+    re-validation after a 2-opt move, no redundant-stop pass) and makes "which
+    cluster does this stop serve" unambiguous, which is what RP1 needs to
+    define its replacement candidates. Sec. 2.4 PROVES the zero-weight glue
+    makes all three insertion rules visit the copies in succession (insertion
+    cost beside a placed copy is exactly 0, and no insertion cost is ever
+    negative), so nothing is lost against exploiting the overlap directly;
+    farthest insertion merely defers them to the end of construction.
+  Contents: (0) where the code goes -- a three-way split rather than all of it
+    in GraphManager: a metricClosure() primitive in Graph.h, the four
+    algorithms in a new algorithms/GTSP.h against an index-only instance (cost
+    matrix + one cluster id per node + depot, no Boost/MoveIt/ROS, so step 6
+    reuses them unchanged), and a planners/CoverageTour.h adapter that is where
+    splitting happens -- the split nodes and zero-weight edges must never enter
+    GraphManager, which VisPRM and VisRRT plan on; (1) the instance, the cost
+    model and its consequences (no leg can be infeasible, so the old
+    "shortcut-or-RRT" fallback is not a feasibility requirement), splitting,
+    the depot as a singleton cluster, and dropping goals unreachable from the
+    root for free out of the depot's Dijkstra sweep; (2) the four algorithms
+    over one shared skeleton, plus the succession proof and the derivation of
+    RP1's s_min = 3 SEPARATION (the PDF's two-edge decomposition is invalid
+    exactly when the two removed edges are within cyclic distance 2, so those
+    pairs are not enumerated at all -- 2.5a covers them and runs first);
+    (3) the API; (4) complexity -- splitting adds NO Dijkstras, the closure is
+    computed over PHYSICAL vertices and copies are rows reached by lookup;
+    (5) degenerate-metric hazards splitting introduces (strict-improvement-only
+    2-opt, deterministic tie-breaking, never infer identity from a zero cost);
+    (6) tour -> motion plan, the per-leg-only smoothing rule, and 6.2 Stav's
+    planned RRT shortcut augmentation; (7) the VERIFICATION POLICY;
+    (8) decisions + two open items; (9) source material kept for reference,
+    including RP2, which is explicitly out of scope.
+  VERIFICATION POLICY (sec. 7, Stav 2026-09-08): code is NOT to be verified
+    immediately after being written. A syntax-only g++ check in the
+    ubuntu1804-husky container is welcome unprompted; anything beyond it (test
+    executables, brute-force comparisons, running the pipeline) must be
+    proposed and agreed FIRST. Sec. 7.2 keeps the verification material as a
+    menu for when it is wanted, not as a step to carry out.
+  STILL OPEN: O1 the split-OFF mode is undesigned, so the adapter must FAIL
+    LOUDLY when split_shared_nodes is false rather than run E-GTSP on
+    overlapping clusters. O2 is DEFERRED, not open: Stav
+    postponed 6.2's RRT shortcut augmentation on 2026-09-09 and may pick it up
+    later, so its scope question (leg-local vs. roadmap augmentation and a
+    re-solve) is deliberately unanswered. Nothing waits on it -- expandTour()
+    already returns a valid motion plan, since every leg is a roadmap path and
+    shortcutting was only ever an improvement, never a feasibility step.
+  O3 RESOLVED 2026-09-09 -> D6, the sixth shaping decision. RP1's independence
+    condition is now an ENUMERATION BOUND, not a per-move guard: 2-opt is
+    enumerated over pairs of removed edges (p < q) whose cyclic separation
+    s = min(q-p, |T|-(q-p)) is at least s_min = 2 for the fixed-node variant
+    (2.5a) and 3 for RP1 (2.5b). The anchors of RP1's two minimisations collide
+    exactly when the reversed-segment length L is in {1, 2, |T|-2, |T|-1},
+    which -- since L and |T|-L are the same move -- is precisely s <= 2, so
+    s_min = 3 is exactly the condition and no runtime guard or fallback path
+    exists. Stav's call was to SKIP those moves rather than price them with
+    2.5a's gain, since 2.5a covers them and runs first. He also chose the pair
+    enumeration over the reversed-segment-length bound first drafted here
+    (2026-09-09): it visits every move once, needs no cyclic reversal, and
+    leaves index 0 alone, where the bounded form did none of those. Two conditions from the
+    earlier draft were rejected and are recorded in 2.5b so they are not
+    re-added: "share a cluster" is vacuous under D3, "share a physical vertex"
+    needs no guard. Consequence: RP1's move set is non-empty only for |T| >= 6,
+    so it does nothing below 5 targets and 2.5a alone improves the tour there.
+    The 6.1 sub-question was settled with it -- non-adjacent copies of one
+    physical vertex are ACCEPTED as two real visits, since merging them needs a
+    relocation (Or-opt) move 2-opt cannot reach. twoOpt(generalized=true) is
+    unblocked and the whole plan is now free of open correctness items.
+  Supersedes: the "TSP Greek Alg" half of local_VisTSP.txt and the unapproved
+    2026-09-01 MST/post-order/shortcut proposal.
+
 project_map.txt
   Role: This file.
 
@@ -998,11 +1491,32 @@ global_plan.txt step               Status   Where it would go
                                             path: the tour is step 3's job and
                                             needs goal-to-goal costs, which the
                                             graph already answers.
-3. Greek TSP (MST + shortcut)      MISSING  New; GraphManager would need an MST
-                                            (Boost has kruskal/prim) and the
-                                            shortcut step can reuse
-                                            PathSmoother/ValidityChecker.
-4. LocalVisTSP                     MISSING  Composition of 2 + 3.
+3. GTSP heuristics: nearest /      MISSING  DESIGN SETTLED 2026-09-08, not
+   farthest / cheapest insertion            written. Three new/extended files
+   + 2-opt  (RESTATED 2026-09-08,           per GTSP_implementation_plan.txt:
+   replaced "Greek TSP alg" =               metricClosure() added to
+   MST + post-order + shortcut)             GraphManager, the four algorithms in
+                                            a new algorithms/GTSP.h over an
+                                            index-only instance, and a
+                                            planners/CoverageTour.h adapter that
+                                            splits shared nodes. Cycle, depot
+                                            seed, node splitting with a
+                                            zero-weight clique, roadmap Dijkstra
+                                            costs, RP1 2-opt. Also needs
+                                            VisibilityPlannerBase::getRoot()
+                                            (root_id_ is protected with no
+                                            accessor). No MST anywhere.
+4. LocalVisTSP                     WRITTEN  planners/LocalVisTSP.h, 2026-09-09.
+                                            Composition of 2 + 3, as expected;
+                                            no new algorithm. Four flags choose
+                                            the rules and whether 2-opt runs.
+                                            Runs GLOBALLY too (locality off) as
+                                            the VisCfgTSP baseline. Wired into
+                                            the node the same day as the
+                                            plan_visibility_tour service. NOT
+                                            YET RUN -- nothing in steps 3 or 4
+                                            has executed, and no client sends
+                                            the new service yet.
 5. Covering / set cover            MISSING  New; needs a reachable-volume model,
                                             which does not exist yet (the
                                             hardcoded AABBs in note 2 above are
@@ -1010,7 +1524,9 @@ global_plan.txt step               Status   Where it would go
 6. 2D TSP over base locations      MISSING  New.
 
 The building blocks are in place for step 3: both planners now hand back a graph
-plus per-target goal vertices, which is what a tour needs. Everything else in the
+plus per-target goal vertices, which is exactly a GTSP instance -- the goal list
+of each target is that target's cluster, and the roadmap answers the pairwise
+costs. Everything else in the
 repo serves the TVMP paper (single target set). The
 building blocks the VisTSP steps will reuse are: VisibilityIntegrity (both
 queries + SampleFromVisibilityRegion), VisualIK, VisibilityOracle (especially

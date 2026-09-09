@@ -1,7 +1,7 @@
 The current plan is to implement an algorithm for the visibility travelling-salesman problem (VisTSP), where the task is to search/illuminate/film a set of targets.
 1. Write the multi-target query for the VI-tree
-2. Implement multi-target querues for VisRRT and VisPRM
-3. Impement Greek TSP alg
+2. Implement multi-target queries for VisRRT and VisPRM
+3. Impement GTSP algorithms: 1. Nearest insertion 2. farthest insertion 3. cheapest insertion 4. 2-opt (2 pair local search) 
 4. Implement LocalVisTSP
 5. Implement the covering algorithm (covering regions with robot reachable volume copies)
 6. Implement a TSP algorithm for the 2D locations

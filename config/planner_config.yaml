@@ -58,3 +58,40 @@ planner:
     vi_threshold: 0.7
     k_neighbors: 7
     limit_diameter_factor: 1000.0
+
+  # --- VisTSP tour parameters (global_plan step 4, planners/LocalVisTSP.h) ---
+  # Read by the plan_visibility_tour service on EVERY call, so a sweep can
+  # change the algorithm set between requests without restarting the node.
+  #
+  # These are parameters rather than service-request fields because ROS
+  # messages have no optional fields: an unset bool would arrive as false and
+  # silently switch an algorithm off.
+  vistsp:
+    # One flag per E-GTSP insertion rule. At least one must be true. All three
+    # share a single metric closure, so running all of them costs barely more
+    # than running one -- and keeping all three is what makes the algorithm
+    # comparison possible.
+    use_nearest_insertion: true
+    use_farthest_insertion: true
+    use_cheapest_insertion: true
+
+    # When true, 2-opt runs on EVERY enabled rule's tour, not just the winner,
+    # so "nearest + 2-opt" and "farthest + 2-opt" can be compared. This is the
+    # generalized RP1 form, which re-picks which configuration of a target's
+    # cluster is used at the ends of the changed edges.
+    use_two_opt: true
+
+    # Configurations required per target from the coverage query. The tour
+    # itself needs only one, so k > 1 buys the tour more choices per target.
+    coverage: 1
+
+    # Radius in metres the base is confined to, measured from the start
+    # configuration.
+    #   > 0  LOCAL run: the base stays in that disk and VisualIK is restricted
+    #        to the arm. This is the per-location unit the layered algorithm
+    #        (GLVisTSP) will invoke once per base location.
+    #   <= 0 GLOBAL run: the base is unconstrained and the same pipeline tours
+    #        the whole environment. This is the DELIBERATE BASELINE (VisCfgTSP)
+    #        used to measure what the layered algorithm's extra stages buy --
+    #        not a missing setting.
+    base_locality_radius: 0.0

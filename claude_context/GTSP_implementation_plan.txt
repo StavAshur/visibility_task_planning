@@ -1,0 +1,867 @@
+GTSP IMPLEMENTATION PLAN  (global_plan.txt step 3)
+==================================================
+Status: IMPLEMENTED 2026-09-09, except sec. 6.2 which Stav deferred (O2).
+  Design settled 2026-09-08 (sec. 8, Q1-Q7) with the last correctness detail
+  resolved 2026-09-09 (O3 -> D6, plus D7). The code is
+  algorithms/GTSP.h (the four heuristics, index-only),
+  GraphManager::metricClosure()/closurePath(),
+  VisibilityPlannerBase::getRoot(), and planners/CoverageTour.h (splitting and
+  expansion). All syntax-checked; NONE OF IT HAS BEEN RUN -- see sec. 7.
+Sources: claude_context/GTSP_heuristic_algorithms.pdf (Fischetti, Salazar and
+  Toth, as reproduced in "The Traveling Salesman Problem and its Variations",
+  sec. 2.5), claude_context/Traveling_Salesman_Problem_{nearest,farthest,
+  cheapest}_insertion.html (Rosenkrantz, Stearns and Lewis 1974).
+Supersedes: the "TSP Greek Alg" (MST -> post-order -> shortcut) sketch in
+  claude_context/local_VisTSP.txt, and the unapproved 2026-09-01 MST proposal.
+
+global_plan.txt step 3 reads: "Impement GTSP algorithms: 1. Nearest insertion
+2. farthest insertion 3. cheapest insertion 4. 2-opt (2 pair local search)".
+
+THE SEVEN DECISIONS THAT SHAPE EVERYTHING BELOW
+  D1  The tour is a CYCLE (it returns to the depot).
+  D2  Every run is seeded from the DEPOT -- the start configuration. The PDF's
+      unrooted "two mutually farthest clusters" seed is dropped.
+  D3  NODE SPLITTING. A configuration seeing several targets is split into one
+      node per target, and the copies form a clique joined by ZERO-WEIGHT
+      edges. Clusters therefore PARTITION the node set and the problem is
+      textbook E-GTSP: exactly one node visited per cluster. Toggleable, but
+      OFF is not implemented (sec. 8, O1).
+  D4  Costs are roadmap Dijkstra distances (the metric closure).
+  D5  2-opt is the PDF's generalized RP1 form -- the move re-picks which node
+      of the cluster is used at the ends of the changed edges.
+  D6  2-opt enumerates PAIRS OF REMOVED EDGES (p < q) and keeps only those
+      whose CYCLIC SEPARATION s = min(q-p, |T|-(q-p)) is at least s_min, with
+      s_min = 2 for the fixed-node variant and s_min = 3 for RP1. RP1's
+      independence assumption fails exactly at s <= 2, so the separation test
+      is part of the enumeration rather than a per-move guard, and there is no
+      fallback path (sec. 2.5b).
+  D7  2-opt visits the admissible pairs in a RANDOM order, shuffled once per
+      pass behind a hardcoded flag and a FIXED seed. Order cannot affect
+      correctness; the fixed seed is what keeps runs reproducible and so
+      keeps 5.2's purpose intact (sec. 2.5).
+
+
+------------------------------------------------------------------------------
+0. WHERE THE CODE LIVES
+------------------------------------------------------------------------------
+Three pieces. The four algorithms do NOT go in GraphManager.
+
+  (a) data_structures/Graph.h -- GraphManager gains ONE new graph algorithm:
+      the metric closure over a subset of vertices (all-pairs shortest-path
+      costs among the tour's candidate stops, plus the predecessor maps needed
+      to expand a tour back into a vertex path). This is a graph algorithm, it
+      sits next to shortestPath() and countConnectedComponents(), and it is the
+      only thing the GTSP heuristics need from the roadmap.
+
+  (b) algorithms/GTSP.h -- the four algorithms, against an INDEX-ONLY
+      instance: an n x n cost matrix, a cluster id per node, and a depot index.
+      No Boost graph, no MoveIt, no ROS, no VertexDesc.
+
+  (c) planners/CoverageTour.h -- the adapter. Turns
+      (CoverageResult + GraphManager + root) into an instance of (b),
+      PERFORMS THE NODE SPLITTING OF D3, and turns the returned tour back into
+      a configuration sequence.
+
+Why not put the four algorithms in GraphManager:
+
+  1. WRONG DEPENDENCY DIRECTION. Graph.h today pulls in only Boost.Graph and
+     Eigen; VisibilityIntegrity.h includes it, not the other way round. The
+     algorithms need the CLUSTERS, which come from CoverageResult -- a planner
+     concept declared in planners/VisibilityPlannerBase.h. Putting them in
+     Graph.h means either Graph.h includes the planner layer (a cycle) or
+     CoverageResult moves down into the data-structure layer.
+
+  2. STEP 6 CANNOT REUSE IT. global_plan.txt step 6 is a tour over 2D base
+     locations, where the "graph" is a small complete graph of floor positions,
+     not a roadmap of configurations. Written against a cost matrix, the same
+     four functions serve step 3 and step 6 unchanged. Written against
+     GraphManager, step 6 has to fabricate a roadmap to use them.
+
+  3. THE SPLIT NODES ARE NOT ROADMAP VERTICES. D3 invents nodes that have no
+     configuration of their own and edges of weight zero that no local planner
+     ever validated. They must NOT be inserted into GraphManager -- that would
+     corrupt the roadmap VisPRM and VisRRT plan on. Splitting therefore has to
+     happen at the instance level, in (c), on a cost matrix that GraphManager
+     hands over and never sees again.
+
+  4. GRAPHMANAGER IS ON THE PAPER'S CODE PATH. It is the roadmap storage for
+     VisPRM and VisRRT as evaluated in 5_Experiments.tex. Adding ~600 lines of
+     task-level combinatorics to it puts step-3 churn in the middle of the code
+     that produced the paper's results.
+
+File placement:
+
+    include/visual_based_planning/algorithms/GTSP.h        (b)
+    include/visual_based_planning/planners/CoverageTour.h  (c)
+    include/visual_based_planning/data_structures/Graph.h  (a) -- extended
+
+A new algorithms/ directory rather than dropping GTSP.h into planners/,
+because steps 5 (set cover over reachable volumes) and 6 (2D TSP) are also
+pure combinatorics with the same "no ROS, no MoveIt" shape, so the directory
+will hold three files, not one. The package is header-only with no
+per-directory CMake, so adding the directory costs nothing.
+
+
+------------------------------------------------------------------------------
+1. THE PROBLEM INSTANCE
+------------------------------------------------------------------------------
+Step 2 (planCoverage() on VisRRT and VisPRM) leaves behind exactly the two
+things a GTSP needs:
+
+  * a roadmap/tree, GraphManager graph_, rooted at root_id_ = the start
+    configuration; and
+  * CoverageResult::goals[t] = the graph vertices whose configuration was
+    CONFIRMED against the visibility oracle to see target t.
+
+1.1  THE COST MODEL (D4)
+     c_ij := shortest-path length from stop i to stop j THROUGH THE ROADMAP
+     (Boost Dijkstra on GraphEdge::weight, which is the ValidityChecker
+     configuration-space distance).
+
+     Consequences, all of them load-bearing later:
+       * Every finite c_ij is realisable by the robot -- it is the length of an
+         actual collision-free roadmap walk. NO LEG OF THE TOUR CAN BE
+         INFEASIBLE. This is what the old "shortcut, and fall back to
+         RRT/VisRRT if the shortcut is hard" step in local_VisTSP.txt existed
+         to handle; under this cost model that fallback is not a feasibility
+         requirement, and shortcutting becomes pure improvement (sec. 6).
+       * The triangle inequality holds by construction (c_ik <= c_ij + c_jk,
+         since concatenating two roadmap paths is a roadmap walk). Both source
+         documents note the insertion heuristics behave much better under it;
+         here it is free rather than assumed. In particular every insertion
+         cost c_iv + c_vj - c_ij is >= 0, which sec. 2.5 relies on.
+
+1.2  NODE SPLITTING (D3) -- THE CENTRAL DESIGN DECISION
+     VisibilityPlannerBase::recordVisibleTargets() credits one vertex to EVERY
+     target it sees, so goals[] as delivered has OVERLAPPING clusters: a
+     configuration seeing three targets appears in three of them. Textbook
+     E-GTSP requires the clusters to partition the node set.
+
+     The instance builder therefore SPLITS: physical roadmap vertex v with
+     see[v] = {t1, t2, t3} becomes three instance nodes v@t1, v@t2, v@t3, each
+     belonging to exactly one cluster, joined pairwise by edges of weight 0.
+     Every copy keeps v's real distances to everything else:
+
+         cost[v@ta][v@tb] = 0                for all a != b
+         cost[v@ta][u@tc] = dijkstra(v, u)   otherwise
+
+     What this buys:
+       * Clusters partition the nodes. The problem is E-GTSP exactly as the two
+         source documents describe it, so the four algorithms are written in
+         their published form with no adaptation for overlap.
+       * COVERAGE IS STRUCTURAL. A tour that visits one node per cluster covers
+         every target, always. There is no coverage bookkeeping anywhere -- no
+         running "uncovered" set, no coverage bitmask, no re-validation after a
+         2-opt move or an RP1 node substitution. This is the single largest code
+         saving of the decision and the reason to prefer it.
+       * WHICH CLUSTER A STOP SERVES IS UNAMBIGUOUS. Without splitting, a stop
+         that belongs to three clusters has no well-defined cluster, and RP1
+         (sec. 2.5) cannot say what its replacement candidates are. Splitting
+         answers that by construction.
+       * Nothing is lost relative to exploiting the overlap directly. Visiting
+         v@t1, v@t2, v@t3 in succession costs 0 extra, so a tour that would
+         have made one physical stop covering three targets is representable at
+         identical cost -- and sec. 2.5's proof shows the construction
+         heuristics actually find it.
+
+     What it costs:
+       * The node count grows from |union of goals[]| to |sum of goals[]|, so
+         the cost matrix grows. This does NOT change the bound already used in
+         sec. 4 (n <= 1 + m*k) and does not add a single Dijkstra: the closure
+         is computed over the DISTINCT PHYSICAL vertices and the split copies
+         are rows and columns copied by lookup. See sec. 4.
+       * The matrix stops being a metric -- distinct nodes at distance 0 -- and
+         exact ties become systematic rather than accidental. See sec. 5.
+
+1.3  THE DEPOT (D2)
+     The depot is root_id_, the start configuration, and it is its own
+     SINGLETON CLUSTER so that "must be visited" needs no special case in any
+     of the four algorithms. Every insertion run is seeded from it (D2), which
+     drops the PDF's unrooted seed and with it the whole d_hk cluster-distance
+     table -- the selection steps use cluster-to-TOUR distance, never
+     cluster-to-cluster. (d_hk's definition is kept in sec. 9 as source
+     material, since step 6's tour may want the unrooted seed.)
+
+     The start configuration CAN see targets -- VisRRTPlanner::planCoverage()
+     calls recordVisibleTargets() on the root before the loop starts. When it
+     does, the root gets split copies in those clusters like any other vertex,
+     glued to the depot node at weight 0, and the tour picks them up for free.
+
+1.4  THE TOUR IS A CYCLE (D1)
+     Insertion positions are the |T| cycle edges, wrap-around included.
+     Insertion never disturbs index 0: a node spliced into edge (T[p], T[p+1])
+     lands at index p+1, so the depot stays first through the whole
+     construction, and there is no tail-reversal variant to handle.
+     Cycle length in stops is exactly m + 1 -- one per target plus the depot.
+
+     2-OPT DOES NOT MOVE THE DEPOT EITHER. D6 enumerates removed-edge pairs
+     with p < q, so the reversed segment T[p+1 .. q] is contiguous and never
+     wraps; index 0 is therefore never inside it and stops[0] stays the depot
+     through the improvement pass as well.
+
+     BUT NOTHING DEPENDS ON THAT (Stav, 2026-09-09). A cycle has no
+     distinguished start. The depot is pinned into every tour by being its own
+     singleton cluster (1.3), and no cost, gain or move in sec. 2 reads its
+     position, so keeping it at index 0 is a convenience of the enumeration and
+     not a constraint the algorithms need. The only place a start genuinely
+     exists is expandTour() (6.1), which must emit a motion plan beginning at
+     the start configuration -- so if a tour ever does need rotating, that is
+     where it belongs, and never inside a move loop.
+     (An earlier draft of D6 bounded L at floor(|T|/2), which forced cyclic
+     wrap-around segments and a per-move rotation to restore the depot. That is
+     why the pair enumeration was preferred; see 2.5.)
+
+1.5  NOT EVERY GOAL VERTEX IS USABLE
+     CoverageResult::goals[t] may contain vertices not connected to the root --
+     deficit[t] counts only the REACHABLE ones, and on a VisPRM roadmap a
+     credited goal can sit in a foreign connected component. The builder must
+     drop them. This costs nothing extra: the Dijkstra sweep from the depot
+     (which the closure runs anyway) returns infinity for exactly those
+     vertices, so reachability filtering falls out of the cost computation and
+     needs no inSameComponent() call and no access to the planner's protected
+     isReachable().
+
+1.6  AN EMPTY CLUSTER MAKES THE INSTANCE INFEASIBLE
+     Report it loudly -- name every target left with no reachable goal and
+     refuse to return a tour -- rather than quietly touring the coverable
+     subset.
+
+
+------------------------------------------------------------------------------
+2. THE FOUR ALGORITHMS
+------------------------------------------------------------------------------
+Because of D3 the clusters partition the nodes, so these are the published
+E-GTSP forms with no overlap handling.
+
+Notation:
+    T             the tour under construction, a cyclic ordered list of stops
+    U             the set of clusters not yet in T
+    C_h           cluster h (all split copies belonging to it)
+    cl(v)         the cluster of node v (unique, by D3)
+    d(C_h, T)  := min over v in C_h, i in T of c[v][i]
+    ins(v, i, j) := c[i][v] + c[v][j] - c[i][j]     >= 0 by 1.1
+
+All three insertion rules share one skeleton and differ ONLY in the selection
+step. The insertion step is identical in all three -- and identical to the
+PDF's -- and it is where the CHOICE OF NODE WITHIN THE CLUSTER is made.
+
+2.0  SHARED SKELETON
+
+    GENERALIZED_INSERTION(instance, rule):
+      T <- [depot]                                     # cycle of one
+      U <- all clusters except the depot's
+
+      # --- Steps 1+2 of the source documents: seed from the depot (D2) ---
+      if U is not empty:
+          if rule is NEAREST or CHEAPEST:  h <- argmin_{g in U} d(C_g, T)
+          if rule is FARTHEST:             h <- argmax_{g in U} d(C_g, T)
+          v <- argmin_{v in C_h} c[depot][v]
+          T <- [depot, v];  U <- U \ {h}
+
+      # --- Steps 3-5: grow ---
+      while U is not empty:
+          (v, pos) <- SELECT_AND_INSERT(rule, T, U)
+          insert v into T at pos
+          U <- U \ {cl(v)}
+      return T
+
+    Candidate insertion positions are the |T| cycle edges (T[p], T[p+1 mod |T|])
+    for p = 0 .. |T|-1. Inserting into the wrap-around edge (T[last], T[0])
+    appends after T[last]; the depot stays at index 0 either way.
+
+2.1  NEAREST INSERTION
+     Selection (step 3):  h <- argmin_{g in U} d(C_g, T)
+     Insertion (step 4):  (v, pos) <- argmin over v in C_h, positions pos,
+                          of ins(v, .).
+     The two steps disagree on purpose, exactly as in the HTML source: the
+     selection step asks which cluster is CLOSEST TO the tour, the insertion
+     step then asks where it is CHEAPEST TO SPLICE IN. A cluster can be
+     selected because one of its nodes is very near the tour and then be
+     inserted using a different node of the same cluster.
+
+2.2  FARTHEST INSERTION  (the variant the PDF spells out for E-GTSP)
+     Selection: h <- argmax_{g in U} d(C_g, T)
+                "determining the uncovered cluster C_h farthest from the
+                clusters currently visited by T" (PDF).
+     Insertion: identical to 2.1 -- "inserting a node v of C_h between two
+                consecutive nodes i and j of T so as to minimize
+                c_iv + c_vj - c_ij" (PDF, verbatim).
+     Seed: the depot, per D2, NOT the PDF's two mutually farthest clusters.
+     This is the one the PDF recommends adapting first, and the one the HTML
+     source reports as empirically best of the three despite the weaker
+     worst-case bound.
+
+2.3  CHEAPEST INSERTION
+     Seed: identical to nearest insertion -- both source documents say so
+           explicitly ("the first two steps are identical to nearest
+           insertion").
+     Selection and insertion collapse into ONE minimisation over everything:
+           (v, pos) <- argmin over g in U, v in C_g, positions pos, of ins(v,.)
+     There is no separate selection step; the cluster served is whichever one
+     the globally cheapest splice belongs to.
+
+2.4  WHY ZERO-WEIGHT GLUE MAKES THE SPLIT COPIES BE VISITED IN SUCCESSION
+     This is the property D3 rests on, and it is provable rather than hoped
+     for. Let v@ta already be in T, and let v@tb be a copy of the same physical
+     vertex in a cluster still in U. For any successor j of v@ta in T:
+
+         ins(v@tb, v@ta, j) = c[v@ta][v@tb] + c[v@tb][j] - c[v@ta][j]
+                            = 0            + c[v][j]     - c[v][j]
+                            = 0
+
+     and by 1.1 no insertion cost is ever negative. Therefore:
+
+       * CHEAPEST INSERTION (2.3) minimises over everything, so as long as any
+         un-served cluster contains a copy of an already-placed vertex it will
+         pick one of them, at cost 0, in preference to anything else. The
+         copies end up adjacent.
+       * NEAREST INSERTION (2.1) selects on d(C_g, T), and d(C_b, T) <=
+         c[v@tb][v@ta] = 0, the minimum possible, so cluster b is selected next
+         and then spliced in at cost 0 beside v@ta. The copies end up adjacent.
+       * FARTHEST INSERTION (2.2) selects on the MAXIMUM, so a cluster holding
+         a copy of a placed vertex is at distance 0 and is DEFERRED to the end
+         of construction. But when it is finally selected, the insertion step
+         still finds the cost-0 position beside v@ta. The copies still end up
+         adjacent -- just discovered last. This is the intended behaviour of
+         farthest insertion, not a defect.
+
+     So all three rules recover the "one physical stop serves several targets"
+     tour that overlapping clusters would have expressed directly, and none of
+     them needs to know that splitting happened.
+
+2.5  2-OPT  ("2 pair local search") -- generalized, per D5
+     Takes a finished tour and removes two edges -- two adjacent PAIRS -- then
+     reconnects the two resulting chains the other way, which reverses the
+     segment between them:
+
+         remove (T[i], T[i+1]) and (T[j], T[j+1])
+         add    (T[i], T[j])   and (T[i+1], T[j+1])
+         reverse T[i+1 .. j]
+
+         gain = c[T[i]][T[i+1]] + c[T[j]][T[j+1]]
+              - c[T[i]][T[j]]   - c[T[i+1]][T[j+1]]
+
+     Our costs are SYMMETRIC (undirected roadmap, Dijkstra), so the internal
+     cost of the reversed segment is unchanged and the four-term gain above is
+     the exact delta. Say this in the code: with asymmetric costs the whole
+     reversed segment would have to be re-summed.
+
+     Reordering stops cannot break coverage -- one node per cluster is still
+     one node per cluster (1.2) -- so no validation is needed after a move.
+
+     MOVE ENUMERATION, SHARED BY 2.5a AND 2.5b (D6). A 2-opt move on a cycle
+     is just a choice of TWO EDGES TO REMOVE -- for a cycle there is exactly
+     one way to reconnect the halves other than the original -- so enumerate
+     the pairs directly:
+
+         for p in [0 .. |T| - 2]
+             for q in [p + 1 .. |T| - 1]
+                 L = q - p;   s = min(L, |T| - L)
+                 skip unless s >= s_min
+
+     with s_min = 2 for 2.5a and s_min = 3 for 2.5b (2.5b says why). s is the
+     CYCLIC SEPARATION of the two removed edges, and "the edges must be far
+     enough apart" is the whole restriction.
+
+     This form was chosen over an L-outer loop bounded at floor(|T|/2)
+     (Stav, 2026-09-09) and the reasons are worth keeping, because the bounded
+     form looks tidier and is worse:
+       * EVERY MOVE EXACTLY ONCE. Each unordered pair {p, q} occurs once.
+         Bounding L instead double-visits every move when |T| is even and
+         L = |T|/2, since a length-L and a length-(|T|-L) reversal are the same
+         cyclic tour.
+       * NO CYCLIC REVERSAL. With p < q the reversed segment T[p+1 .. q] never
+         wraps, so the reversal is a plain std::reverse over a contiguous range
+         and index 0 is never inside it. Bounding L forces j = (i + L) mod |T|,
+         which produces wrap-around segments and, with them, the need to
+         restore the depot's position afterwards. The bound bought nothing and
+         cost that machinery.
+       * NOTHING IS LOST. Restricting to non-wrapping segments loses moves only
+         if L is ALSO bounded: the pair {0, 4} with |T| = 6 is unreachable as a
+         short segment but is simply p = 0, q = 4 here, reversing T[1..4].
+
+     s <= 1 is skipped in BOTH variants: the two removed edges then share a
+     stop, and the reversal re-adds exactly the edges it removed, so the gain is
+     identically 0. These are no-ops, not near-misses.
+
+     RANDOMIZED SCAN ORDER (Stav, 2026-09-09; D7). The admissible pairs are
+     collected into a vector and shuffled once per pass, behind a hardcoded
+     flag -- kGTSPRandomizePairOrder in algorithms/GTSP.h, not a call parameter,
+     because it changes the character of the search rather than a per-call
+     detail.
+     WHY. Both variants are FIRST-improvement searches: each improving move is
+     applied as it is found, so the local optimum reached depends on the visit
+     order, and lexicographic order biases it systematically toward moves among
+     the low-index stops. Shuffling removes that bias, and varying the seed
+     makes the pass a cheap multi-restart. (Under best-improvement the order
+     would be irrelevant except for ties, so this only matters because of the
+     first-improvement design.)
+     ORDER CANNOT AFFECT CORRECTNESS. Every accepted move still strictly
+     decreases the true cost (5.1), which is the whole basis of termination and
+     of the never-worse-than-input guarantee; neither the gain accounting nor
+     RP1's decomposition reads the scan order.
+     THE SEED IS FIXED, AND THAT IS THE POINT. A random order would otherwise
+     reintroduce precisely what 5.2 exists to prevent -- the same instance
+     giving a different tour every run, which makes comparing the four
+     algorithms meaningless. kGTSPPairOrderSeed keeps runs reproducible; to do
+     restarts, vary it deliberately and RECORD the value. Never seed from the
+     clock or std::random_device.
+     IT DOES NOT REPLACE 5.2. The argmins inside RP1's minimisation and inside
+     the insertion steps must still break ties deterministically, or a fixed
+     seed would reproduce nothing. It also touches 2-opt only; the three
+     insertion constructions stay deterministic greedy.
+
+     2.5a  THE MOVE WITH THE NODE SET FIXED. Classic 2-opt on the chosen
+           stops, the gain above, accept while gain > eps. "This approach has
+           however the drawback of leaving the set of visited nodes unchanged"
+           (PDF). Write this first: 2.5b reuses its move enumeration, and it is
+           what covers the L == 2 moves 2.5b skips.
+
+     2.5b  RP1 -- THE GENERALIZED MOVE (this is what step 3 delivers). The same
+           reversal, but the node used in the clusters at the ends of the two
+           NEW edges is re-chosen at the same time. For a new edge (u, w) with
+           u's predecessor p and w's successor s:
+
+               (u*, w*) <- argmin over u' in C_cl(u), w' in C_cl(w)
+                           of  c[p][u'] + c[u'][w'] + c[w'][s]
+
+           which is the PDF's three-term form
+           "min{c_ia + c_ab + c_bh : a in C_alpha, b in C_beta}" with i, h the
+           nodes before and after the pair. The PDF evaluates the two new edges
+           INDEPENDENTLY -- |C_alpha||C_beta| + |C_gamma||C_delta| comparisons
+           per move rather than the |C|^4 of a joint optimisation. We keep that
+           decomposition, and s_min = 3 is what makes it valid.
+
+           Under D3, C_cl(u) is simply u's cluster: splitting is what makes
+           "the other nodes of this stop's cluster" well defined, and no
+           coverage check is needed on a substitution because the substitute is
+           in the same cluster by construction.
+
+           After the reversal the tour reads
+
+               T[i-1], T[i], T[j], T[j-1], ..., T[i+1], T[j+1], T[j+2]
+
+           so the two minimisations are
+
+               min1   new edge A = (T[i],   T[j]  ), anchors T[i-1], T[j-1]
+               min2   new edge B = (T[i+1], T[j+1]), anchors T[i+2], T[j+2]
+
+           WHY s_min = 3, AND WHY THERE IS NO RUNTIME GUARD (D6). The identity
+
+               reported gain = unchanged edges + min1 + min2
+
+           holds only while the six edges the two minimisations own are
+           distinct and the four anchors are themselves unmutated. The anchors
+           sit at positions {p-1, q-1, p+2, q+2} and the mutated stops at
+           {p, p+1, q, q+1}; checking those four positions one at a time, the
+           two sets intersect exactly when
+
+               L in {1, 2, |T| - 2, |T| - 1}
+
+           and since L and |T| - L describe the SAME move, that set is
+           precisely s <= 2. So s_min = 3 is not a conservative margin; it is
+           exactly the condition, and every move the enumeration admits has a
+           sound decomposition.
+           The condition is therefore part of the ENUMERATION, NOT A PER-MOVE
+           GUARD: nothing is evaluated and then repaired, and there is no
+           fallback path to maintain. Do not reintroduce one.
+           Decided with Stav on 2026-09-09: SKIP the s == 2 moves rather than
+           price them with 2.5a's fixed-node gain. 2.5a covers them and runs
+           first, so nothing is lost, and the fallback would have been the only
+           place in 2-opt where a move is scored by a different rule than the
+           one that enumerated it.
+           Two earlier candidate conditions were considered and rejected, which
+           is worth recording so they are not re-added: "the two new edges
+           share a cluster" is VACUOUS under D3 (the tour holds one node per
+           cluster and clusters are disjoint, so the four mutated stops are
+           always in four distinct clusters and the candidate sets cannot
+           collide), and "they share a physical vertex" needs no guard at all
+           (such a tour is priced correctly by the cost matrix -- merely
+           wasteful, see the note in 6.1).
+
+           WHAT s == 2 WOULD DO, i.e. why s_min is not arbitrary. At s == 2 the
+           tour edge between old positions q and q-1 is owned by BOTH
+           minimisations and DOUBLE-BOOKED, each copy pairing one mutated
+           endpoint with one stale anchor:
+
+               realized:  ... c[a][b] + c[b][a']              + c[a'][b'] ...
+               reported:  ... c[a][b] + c[b][T1] + c[T2][a']  + c[a'][b'] ...
+                                        ^^^^^^^^^^^^^^^^^^^^ two terms, one edge
+
+           The error is two-sided, and NODE SPLITTING makes the harmful
+           direction systematic: if T[p+1]'s physical vertex also sees T[q]'s
+           target -- exactly the multi-target vertex D3 splits -- then a
+           candidate b exists with c[b][T1] = 0, and symmetrically
+           c[T2][a'] = 0, so the argmin is DRAWN TOWARD zeroing the stale terms
+           while the edge actually paid, c[b][a'], is the real roadmap distance
+           and can be large. Reported gain large, realized gain negative.
+           That breaks 2-opt's contract that every accepted move strictly
+           decreases the TRUE cost -- the one property that buys termination
+           (finitely many tours, cost strictly decreasing, so no tour repeats)
+           and the guarantee that the output is never worse than the input,
+           which is the only reason to run an improvement pass on a constructed
+           tour at all. It would surface as validateTour() disagreeing with the
+           incrementally maintained cost, i.e. the monotone-decrease assertion
+           of 7.2.
+
+           CONSEQUENCE OF THE BOUND. Since s <= floor(|T|/2) always, the move
+           set is non-empty only for |T| >= 2*s_min, i.e. |T| >= 6 for RP1.
+           With m + 1 stops (D1, D2) RP1 therefore does nothing until there are
+           5 targets, and below that the tour is improved by 2.5a alone. Assert
+           nothing on this -- an empty move set is a legitimate outcome, not an
+           error; RP1 simply reports zero accepted moves.
+
+           The PDF also mentions a 3-opt cluster exchange in RP1. Out of scope:
+           step 3 asks for 2-opt.
+
+
+------------------------------------------------------------------------------
+3. PROPOSED API
+------------------------------------------------------------------------------
+3.1  data_structures/Graph.h -- added to GraphManager
+
+    /// All-pairs shortest-path costs among a subset of vertices, with enough
+    /// predecessor information to rebuild each pair's vertex path.
+    struct SubsetClosure {
+        std::vector<VertexDesc> nodes;                    // subset, in index order
+        std::vector<std::vector<double>> cost;            // n x n, inf = unreachable
+        std::vector<std::vector<VertexDesc>> predecessor; // one Dijkstra map per source
+    };
+
+    SubsetClosure metricClosure(const std::vector<VertexDesc>& subset);
+    std::vector<VertexDesc> closurePath(const SubsetClosure& c, int from, int to) const;
+
+    Rationale for adding this rather than calling the existing shortestPath()
+    in a double loop: shortestPath() runs a full single-source Dijkstra and
+    then THROWS THE PREDECESSOR AND DISTANCE MAPS AWAY, keeping one path. A
+    double loop over it therefore runs n^2 Dijkstras to obtain information that
+    n Dijkstras already contain, and still cannot answer a second pair from the
+    same source. metricClosure() keeps one predecessor map per source, which is
+    also exactly what sec. 6 needs to expand a tour into a path.
+
+    NOTE: this operates on PHYSICAL vertices and knows nothing about splitting.
+    It never sees a zero-weight glue edge.
+
+3.2  algorithms/GTSP.h -- the four algorithms, index-only
+
+    struct GTSPInstance {
+        std::vector<std::vector<double>> cost;      // n x n symmetric, inf allowed
+        std::vector<int>                 cluster;   // cluster[v], unique per node (D3)
+        std::vector<std::vector<int>>    clusters;  // clusters[h] = node indices
+        int  depot  = -1;                           // its own singleton cluster (1.3)
+        bool closed = true;                         // D1: a cycle
+    };
+
+    struct GTSPTour {
+        std::vector<int> stops;      // node indices; stops[0] == depot; cyclic
+        double cost = 0.0;
+        bool feasible = false;
+        std::vector<int> unserved;   // clusters missing; empty iff feasible
+    };
+
+    enum class InsertionRule { NEAREST, FARTHEST, CHEAPEST };
+
+    GTSPTour insertionTour(const GTSPInstance&, InsertionRule);
+    bool     twoOpt(const GTSPInstance&, GTSPTour&, bool generalized,
+                    int max_passes = 100);          // true if it improved
+    bool     validateTour(const GTSPInstance&, const GTSPTour&);
+    double   tourCost(const GTSPInstance&, const GTSPTour&);
+
+    cluster[] is a single int per node, not a list -- that is D3 expressed in
+    the type, and it is what makes RP1's candidate set unambiguous (2.5b).
+
+    validateTour() re-derives cost and cluster coverage from scratch. The
+    incremental bookkeeping in the insertion loop and in 2-opt is the most
+    likely place for a bug and this is cheap to check against, so call it on
+    every result.
+
+3.3  planners/CoverageTour.h -- the adapter, and where splitting happens
+
+    struct CoverageTourParams {
+        bool split_shared_nodes = true;   // D3. false is NOT implemented (sec. 8 O1)
+    };
+
+    struct CoverageTourInstance {
+        GTSPInstance   gtsp;
+        SubsetClosure  closure;           // over PHYSICAL vertices
+        std::vector<int> node_vertex;     // gtsp node -> index into closure.nodes
+        std::vector<int> node_target;     // gtsp node -> target it serves (-1 = depot)
+    };
+
+    bool buildCoverageTourInstance(GraphManager& g, const CoverageResult& cov,
+                                   VertexDesc root, const CoverageTourParams&,
+                                   CoverageTourInstance& out);
+
+    std::vector<std::vector<double>>
+    expandTour(const GTSPTour&, const CoverageTourInstance&, GraphManager&);
+
+    buildCoverageTourInstance():
+      1. collect the distinct physical vertices {root} u goals[], run
+         metricClosure() over them;
+      2. drop those at infinite cost from the depot (1.5);
+      3. SPLIT: emit one gtsp node per (surviving vertex, target it is credited
+         to) pair, plus the depot node; fill cost[] from the closure by lookup
+         through node_vertex, writing 0 wherever two nodes share a physical
+         vertex (1.2);
+      4. return false, naming every target left with an empty cluster (1.6).
+
+    node_vertex is the indirection that keeps splitting out of GraphManager and
+    makes step 6's expansion of the two-line lookup trivial.
+
+    ONE SMALL PLANNER CHANGE IS NEEDED: root_id_ is protected on
+    VisibilityPlannerBase and there is no accessor, so a caller holding a
+    planner cannot pass the root in. Add `VertexDesc getRoot() const`. It
+    exposes state the caller already owns indirectly (it set the start
+    configuration) and adds no behaviour.
+
+
+------------------------------------------------------------------------------
+4. WHERE THE TIME GOES
+------------------------------------------------------------------------------
+    m  = #targets
+    k  = coverage (configurations kept per target)
+    P  = distinct physical goal vertices, |P| <= 1 + m*k
+    n  = gtsp nodes after splitting = 1 + sum_t |C_t| <= 1 + m*k
+    |T| = m + 1
+
+    metric closure        |P| Dijkstras   O(|P| (E + V log V))   <-- DOMINATES
+    splitting             O(n^2) matrix fill, all by lookup -- NO extra Dijkstra
+    nearest / farthest    O(m) iters x (selection O(n|T|) + insertion O(k|T|))
+    cheapest insertion    O(m) iters x O(n |T|)
+    2-opt, 2.5a           O(|T|^2) per pass
+    2-opt, 2.5b (RP1)     O(|T|^2 k^2) per pass
+  pair list + shuffle   O(|T|^2) once, O(|T|^2) per pass -- noise (D7)
+
+Two points worth stating in the code:
+
+  * SPLITTING ADDS NO DIJKSTRAS. The closure is computed over PHYSICAL
+    vertices; a split copy's row is the physical vertex's row, reached through
+    node_vertex. Splitting grows the matrix, not the graph search. Since the
+    matrix fill was already O(n^2) and n was already bounded by 1 + m*k, D3
+    costs nothing measurable.
+
+  * THE COMBINATORIAL PART IS NEGLIGIBLE. With m in the tens and k in the low
+    single digits, n is a few tens; the real cost is |P| single-source
+    Dijkstras over a roadmap VisPRM may have grown to PRMParams::max_size =
+    10000 vertices. So: build the closure ONCE and hand the same matrix to all
+    four algorithms -- running all four and keeping the best tour costs barely
+    more than running one -- and never recompute the closure inside 2-opt.
+
+
+------------------------------------------------------------------------------
+5. DEGENERATE-METRIC HAZARDS INTRODUCED BY SPLITTING
+------------------------------------------------------------------------------
+D3 makes the cost matrix a PSEUDOmetric: distinct nodes at distance 0. The
+triangle inequality survives and insertion costs stay >= 0 (1.1), so the
+algorithms are correct, but three things must be handled deliberately.
+
+  5.1  STRICT IMPROVEMENT ONLY. 2-opt must accept a move only when
+       gain > epsilon, never >= 0. With zero-cost pairs everywhere, gain == 0
+       moves are systematic rather than accidental, and accepting them makes
+       the local search cycle forever.
+
+  5.2  DETERMINISTIC TIE-BREAKING. Exact ties in the selection and insertion
+       argmins are now the normal case, not a measure-zero event. Break every
+       tie by lowest node index, then lowest position index. Without this the
+       four algorithms give different tours on different runs over the same
+       instance, which makes any later comparison of them meaningless.
+
+  5.3  NEVER INFER IDENTITY FROM DISTANCE. c[i][j] == 0 does not imply i == j.
+       No code may test node equality by cost, and expandTour() must find the
+       zero-cost runs through node_vertex (sec. 6), not by comparing costs.
+
+
+------------------------------------------------------------------------------
+6. FROM A TOUR TO A MOTION PLAN
+------------------------------------------------------------------------------
+6.1  EXPANSION
+     expandTour() walks the cycle, and for each consecutive pair:
+       * if the two stops share a physical vertex (equal node_vertex), the leg
+         is empty -- COLLAPSE the run of split copies into one waypoint. This
+         is where "one physical stop serves several targets" is turned back
+         into a single stop, and it is the only place splitting is undone.
+       * otherwise, concatenate the roadmap path from the closure's predecessor
+         maps and read off each vertex's joint_config.
+     Then close the cycle back to the depot (D1).
+
+     NOTE (settled 2026-09-09, was tied to O3): only ADJACENT copies are
+     collapsed. RP1 can leave two copies of one physical vertex at non-adjacent
+     tour positions, which expands into two real visits to the same
+     configuration. ACCEPTED, NOT CHASED (Stav): the cost matrix prices those
+     two visits correctly, so it is not a phantom gain, and merging them is not
+     a cleanup this rule could do -- the two copies belong to two DIFFERENT
+     clusters, so neither can be dropped without breaking one-node-per-cluster,
+     and bringing them together means RELOCATING one, an Or-opt/insertion move
+     that 2-opt cannot reach. Recorded as possible future work, not a gap in
+     step 3.
+
+     SMOOTH PER LEG, NOT ACROSS THE TOUR. PathSmoother::smoothPath() runs a
+     Dijkstra over ALL pairs of waypoints and takes any collision-free
+     straight-line shortcut, so run on the concatenated tour it will happily
+     shortcut straight past the observation configurations -- the very stops
+     the tour exists to visit. Call it once per leg, with the stop
+     configurations pinned as leg endpoints, and reassemble. (This is the same
+     trap VisibilityPlannerBase::finalizePath() avoids only because its path
+     has a single goal at the end.)
+
+     Shortcutting here is a pure improvement, not a feasibility step: every leg
+     is already a valid roadmap path (1.1). Nothing needs an RRT fallback.
+
+6.2  PLANNED, NOT YET SPECIFIED -- RRT SHORTCUT AUGMENTATION (Stav, 2026-09-08)
+     A further post-processing step Stav is considering: find the k edges whose
+     addition would shorten the tour the most, and try to realise them with an
+     RRT. Not designed yet; recorded here with the structural points it will
+     have to respect.
+
+       * WHERE THE SLACK IS. Each leg of the tour costs c[u][w], the roadmap
+         shortest path, while the straight line between the same two
+         configurations costs ValidityChecker::distance(u, w) <= c[u][w]. The
+         difference is the slack the roadmap imposes, and it is computable for
+         every leg for free once the tour exists. Ranking the legs by
+         c[u][w] - distance(u, w) and attempting the k largest is the natural
+         reading of "the k edges that reduce the tour most".
+       * THAT RANKING IS OPTIMISTIC, NOT A GAIN. An RRT between u and w does
+         not return the straight line; it returns some collision-free path
+         whose length can exceed distance(u, w) and, in a cluttered scene, even
+         exceed the current leg. So the ranking orders the ATTEMPTS, and each
+         result must be accepted only if it is actually shorter than the leg it
+         replaces. Never install a "shortcut" unmeasured.
+       * TWO SCOPES, AND THEY DIFFER. (i) LEG-LOCAL: replace the path of one
+         existing leg, leaving the tour order untouched. Cheap, always safe,
+         and a strict improvement. (ii) ROADMAP AUGMENTATION: add the new edges
+         to the roadmap, recompute the closure, and re-run the tour -- which
+         can change the ORDER, since a new edge alters distances between pairs
+         that are not adjacent in the current tour. Strictly more powerful and
+         strictly more expensive. Worth deciding which one is meant before
+         writing it.
+       * 6.1's per-leg smoothing already does the straight-line half of this
+         for free. The RRT step is what handles legs where the straight line is
+         blocked, so (i) is a direct extension of 6.1 rather than a new stage.
+
+
+------------------------------------------------------------------------------
+7. VERIFICATION POLICY  (Stav, 2026-09-08)
+------------------------------------------------------------------------------
+Code is NOT to be verified immediately after being written. Compilation checks
+are welcome and expected; anything beyond that -- test executables, brute-force
+comparisons, running the pipeline -- must be proposed and agreed FIRST.
+
+  7.1  ALWAYS, unprompted: a syntax-only check in the ubuntu1804-husky
+       distrobox container (g++ -fsyntax-only, C++14) for every header touched.
+       Never catkin build.
+
+  7.2  ONLY AFTER ASKING: the verification material below is kept here as a
+       menu for when it is wanted, not as a step to be carried out.
+         * singleton clusters -> the instance degenerates to plain TSP, and all
+           three insertion rules must reproduce the textbook answers on a small
+           Euclidean point set whose optimum is known by brute force;
+         * brute force over all cluster-sequence-and-node choices for m <= 6,
+           k <= 3, checking each heuristic's ratio to the true optimum;
+         * splitting: a vertex seeing three targets must come out as three
+           adjacent stops in all three insertion rules (the claim proved in
+           2.4), and expandTour() must collapse them to one waypoint;
+         * a target whose cluster is empty -> infeasible, target named;
+         * an unreachable node (inf cost) -> excluded, never inserted;
+         * 2-opt on a deliberately crossed tour must uncross it, and
+           tourCost() must decrease strictly monotonically per pass;
+         * RP1's s_min = 3 separation (2.5b): no move whose two removed edges
+           are within cyclic distance 2 may be enumerated, and every gain RP1
+           reports must equal the realized change in tourCost();
+         * validateTour() agrees with the incrementally maintained cost on
+           every result of every algorithm.
+
+
+------------------------------------------------------------------------------
+8. DECISIONS AND WHAT REMAINS OPEN
+------------------------------------------------------------------------------
+Answered by Stav on 2026-09-08 (the question numbers are the 2026-09-08
+proposal's):
+
+  Q1  CYCLE OR OPEN PATH?  -> CYCLE, for now. (D1)
+  Q2  SEED?                -> Always the depot. The PDF's unrooted
+                              mutually-farthest-clusters seed is dropped, and
+                              with it the d_hk table. (D2)
+  Q3  OVERLAP?             -> Option (b), E-GTSP proper, via a TOGGLEABLE NODE
+                              SPLITTING mode: shared nodes are duplicated into
+                              one node per target, joined by a zero-weight
+                              clique so the copies get visited in succession.
+                              (D3; the succession claim is proved in 2.4.)
+                              Confirmed as option (b): clusters partition the
+                              nodes and exactly one node per cluster is
+                              visited. The zero-weight clique is what makes (b)
+                              lose nothing against (a) -- and it additionally
+                              removes the overlap bookkeeping, the uniq()/cand()
+                              rule, and the redundant-stop pass that (a) needed.
+  Q4  "duplicate target cfg"? -> Yes, the GTSP framing is what that note meant:
+                              the k configurations per target are that target's
+                              cluster and the tour picks one.
+  Q5  COST MODEL?          -> Roadmap Dijkstra distance. (D4) Plus a possible
+                              RRT shortcut post-processing step -- see 6.2.
+  Q6  2-OPT VARIANT?       -> 2.5b, the generalized RP1 form, which Stav notes
+                              works well with node duplication (and 1.2/2.5b
+                              explain why: splitting is what makes RP1's
+                              candidate set well defined). (D5)
+  Q7  RP2 (layered-DAG optimal node choice)? -> NO. Out of scope; the amount of
+                              code is large enough already.
+
+  O3  RESOLVED 2026-09-09 (was "first item to discuss next session"). RP1's
+      independence condition, sec. 2.5b -> D6. The condition first written
+      there was wrong on two of its three clauses ("share a cluster" is vacuous
+      under D3, "share a physical vertex" needs no guard); the real condition
+      is a reversed-segment length test, and Stav's call was to express it as
+      an ENUMERATION BOUND and skip the offending moves rather than fall back
+      to 2.5a's fixed-node gain for them. Result: s_min = 3 for RP1, no runtime
+      guard, no fallback path. Restated on 2026-09-09 in terms of the CYCLIC
+      SEPARATION of the two removed edges over a plain pair enumeration, which
+      is Stav's formulation and strictly simpler than the reversed-segment
+      length bound first written here -- see 2.5 for the three reasons. Nothing about D1-D5 changed. The 6.1 sub-question
+      was settled at the same time: non-adjacent copies of one physical vertex
+      are accepted as two visits and not chased (see the note in 6.1).
+
+STILL OPEN:
+
+  O1  NODE SPLITTING OFF. Stav will design the non-split algorithm later.
+      Until then, buildCoverageTourInstance() must FAIL LOUDLY when
+      split_shared_nodes is false -- return false with an error saying the
+      non-split mode is not implemented -- rather than run the E-GTSP
+      algorithms on overlapping clusters, where cl(v) is ambiguous and RP1 has
+      no defined candidate set (1.2).
+
+  O2  DEFERRED BY STAV, 2026-09-09 -- not a blocking question any more. 6.2's
+      RRT shortcut augmentation is postponed; he may want it later. The scope
+      question (leg-local shortcuts vs. roadmap augmentation and a re-solve)
+      stays unanswered ON PURPOSE and is to be settled if and when he picks it
+      up. Nothing else waits on it: expandTour() already returns a fully valid
+      motion plan, because every leg is a roadmap path (1.1) and shortcutting
+      was only ever an improvement, never a feasibility step. Step 3 is
+      complete without it.
+
+
+
+------------------------------------------------------------------------------
+9. SOURCE MATERIAL KEPT FOR REFERENCE
+------------------------------------------------------------------------------
+9.1  CLUSTER-TO-CLUSTER DISTANCE. The PDF defines
+     d_hk := min{c_ij : i in C_h, j in C_k} and uses it only for its unrooted
+     seed ("the two clusters farthest from each other"), which D2 drops. Kept
+     here because step 6's tour over 2D base locations has no natural depot and
+     may want it.
+
+9.2  WORST-CASE BEHAVIOUR. For metric TSP (Rosenkrantz, Stearns and Lewis
+     1974): nearest insertion and cheapest insertion are 2-approximations;
+     farthest insertion has only a logarithmic-in-n guarantee but is the best
+     of the three in practice. None of these bounds survive the generalization
+     to GTSP -- neither source claims they do, and the PDF only observes that
+     the adaptations "are likely to produce better solutions when the costs
+     satisfy the triangle inequality", which ours do (1.1).
+
+     The exact constants in the HTML sources are inline GIF images
+     (IMG000nn_*.GIF) that were not saved alongside the .html files, so the
+     bounds above are quoted from the published result rather than read off
+     those copies. If the images turn up, the constants are worth transcribing.
+
+9.3  RP2, NOT BEING BUILT (Q7). For a FIXED cluster sequence the PDF finds the
+     OPTIMAL node choice by shortest paths through a layered acyclic network of
+     m+1 layers, |C_h1| shortest paths, and notes that running it over all
+     (m-1)! sequences gives an exact O((m-1)! n^3) algorithm. Recorded so the
+     option is findable later; explicitly out of scope for step 3.
