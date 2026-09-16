@@ -209,7 +209,6 @@ public:
         recordVisibleTargets(root_id_, start_joint_values_,
                              graph_.getVertexPose(root_id_), snap_fov_on_insert_);
 
-        std::uniform_real_distribution<double> dist_01(0.0, 1.0);
         ros::WallTime start_time = ros::WallTime::now();
 
         for (int i = 0; i < rrt_params_.max_iterations; ++i) {
@@ -227,19 +226,15 @@ public:
             }
 
             // --- Step 1: Sampling ---
-            // A goal-biased draw aims at ONE target still short of its coverage, chosen
-            // uniformly among them, so effort follows what is left to do.
-            std::vector<double> q_rand;
-            bool have_sample = false;
-
-            if (use_visibility_integrity_ && dist_01(rng_) <= rrt_params_.goal_bias) {
-                int t = pickUnsatisfiedTarget();
-                if (t >= 0 && sampleVisibilityGoal(targets_[t], q_rand)) {
-                    have_sample = true;
-                }
-            }
-
-            if (!have_sample) q_rand = sampleLocalUniform();
+            // UNIFORM ONLY. The goal-biased draw that used to sit here aimed at one
+            // unsatisfied target, drawn uniformly, and asked the VI-tree for a position
+            // that sees it (sampleVisibilityGoal). Removed 2026-09-16 at Stav's
+            // request: it did not pay for itself here. Note what follows from that --
+            // NOTHING in this query picks a target any more. Targets are no longer
+            // chased one at a time; every node inserted is tested against EVERY target
+            // still short of coverage, in recordVisibleTargets(). plan(), which serves
+            // the paper's single-target query, keeps its goal bias.
+            std::vector<double> q_rand = sampleLocalUniform();
 
             // --- Step 2: Nearest Neighbor ---
             std::vector<VertexDesc> nearest = nn_.kNearest(q_rand, 1);

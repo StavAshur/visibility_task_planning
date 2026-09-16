@@ -105,6 +105,32 @@ protected:
 
     // --- Per-run configuration ---
     bool shortcutting_;
+    /**
+     * @brief Per-run tally of what recordVisibleTargets() did with each vertex.
+     *
+     * A coverage query that finds nothing is otherwise silent about WHY: every
+     * rejection in recordVisibleTargets() is a `continue`, so "no target was ever
+     * positioned well" and "every snap failed IK" look identical from outside.
+     * These counters separate them, and are reported by logCoverageSummary() at the
+     * end of every run whether it succeeded or not.
+     */
+    struct CoverageDebug {
+        long vertices_tested = 0;      ///< calls to recordVisibleTargets()
+        long locality_skipped = 0;     ///< vertex outside the base-locality disk
+        long direct_hits = 0;          ///< A: the configuration already looks at a target
+        long position_hits = 0;        ///< B: the POSITION sees a target, so a snap is tried
+        long ik_failures = 0;          ///< VisualIK found no configuration at that position
+        long snap_unseen = 0;          ///< the snapped configuration failed the oracle
+        long snap_outside = 0;         ///< the snapped configuration left the disk
+        long snap_edge_invalid = 0;    ///< no valid edge from the vertex to its snap
+        long snap_credited = 0;        ///< B ended in a goal creditTarget() accepted
+        /// A or B produced a configuration that sees the target, and creditTarget()
+        /// still turned it down: the same vertex twice, or too close in configuration
+        /// space to a goal this target already holds (min_goal_separation_).
+        long credit_rejected = 0;
+    };
+    CoverageDebug coverage_dbg_;
+
     bool use_visibility_integrity_;   ///< Use visibility-guided goal sampling.
     int time_cap_;
     RRTParams rrt_params_;
@@ -363,7 +389,12 @@ public:
             points.push_back(Eigen::Vector3d(p.x, p.y, p.z));
         }
         target_mes_ = enclosingBall(points);
-        ROS_INFO("Target MES has center = (%f,%f,%f) and radius = %f",
+        // Named in full because a tour request logs this line too, where its radius
+        // is large and meaningless: the MES encloses ALL the target centres, and only
+        // plan() - the single-target query - reads it. The coverage query works from
+        // targets_ and never touches it.
+        ROS_INFO("Target MES (enclosing ball of all target centres; read by plan() only, "
+                 "NOT by the coverage query) center = (%f,%f,%f), radius = %f",
                 target_mes_.center.x(), target_mes_.center.y(), target_mes_.center.z(), target_mes_.radius);
     }
 
@@ -532,6 +563,7 @@ public:
         coverage_.goals.assign(targets_.size(), std::vector<VertexDesc>());
         coverage_.deficit.assign(targets_.size(), coverage_k_);
         coverage_.complete = false;
+        coverage_dbg_ = CoverageDebug();
 
         if (locality_.enabled) {
             locality_.center = ctx_->basePosition(start_joint_values_);
@@ -543,6 +575,20 @@ public:
 
         ROS_INFO("Coverage query: %lu targets, %d configuration(s) required per target.",
                  targets_.size(), coverage_k_);
+
+        // The targets as the PLANNER holds them, in the planning frame. Printed so a
+        // run can be checked against what the client published as markers: same
+        // indices, same centres, same radii, same frame, or the picture in RViz is not
+        // the problem being solved. The index is the one every later message uses -
+        // the deficit reports, the tour's stop_target, the marker labels.
+        const std::string frame = ctx_->planning_scene_
+                                ? ctx_->planning_scene_->getPlanningFrame()
+                                : std::string("<no scene>");
+        for (size_t t = 0; t < targets_.size(); ++t) {
+            ROS_INFO("  target %lu: center (%.4f, %.4f, %.4f), radius %.4f  [frame %s]",
+                     t, targets_[t].center.x(), targets_[t].center.y(),
+                     targets_[t].center.z(), targets_[t].radius, frame.c_str());
+        }
 
         reportUnseeableTargets();
         return true;
@@ -607,7 +653,12 @@ public:
 
         if (min_goal_separation_ > 0.0) {
             for (VertexDesc g : goals) {
-                if (distance(q, graph_.getVertexConfig(g)) < min_goal_separation_) return false;
+                if (distance(q, graph_.getVertexConfig(g)) < min_goal_separation_) {
+                    ROS_INFO("Coverage query: target %lu already holds a candidate within "
+                             "%.3f of this one; not counting it.",
+                             t, min_goal_separation_);
+                    return false;
+                }
             }
         }
 
@@ -666,18 +717,33 @@ public:
         // from sampleLocalUniform(). A scan tests whatever the graph already held, which
         // the sampler did not place there -- and a goal whose base is outside the disk
         // does not answer the question that was asked.
-        if (!inLocality(q)) return 0;
+        ++coverage_dbg_.vertices_tested;
+        if (!inLocality(q)) {
+            ++coverage_dbg_.locality_skipped;
+            return 0;
+        }
 
         int credited = 0;
 
+        // EVERY target still short of coverage is tried against this vertex, not one
+        // chosen target: a single configuration may be credited to several at once,
+        // which is what shortens the eventual tour. Targets already at their coverage
+        // are skipped because k more candidates for them would not change the result.
         for (size_t t = 0; t < targets_.size(); ++t) {
             if (coverage_.deficit[t] == 0) continue;
             const Ball& target = targets_[t];
 
             // A. The configuration already sees the target.
-            if (ctx_->vis_oracle_->checkBallBeamVisibility(pose, target.center, target.radius)
-                    > ctx_->visibility_threshold_) {
+            const double direct_fraction =
+                ctx_->vis_oracle_->checkBallBeamVisibility(pose, target.center, target.radius);
+            if (direct_fraction > ctx_->visibility_threshold_) {
+                ++coverage_dbg_.direct_hits;
+                ROS_INFO("Coverage: vertex %ld ALREADY LOOKS AT target %lu "
+                         "(sees %.2f > %.2f).",
+                         static_cast<long>(v), t, direct_fraction,
+                         ctx_->visibility_threshold_);
                 if (creditTarget(t, v, q)) credited++;
+                else ++coverage_dbg_.credit_rejected;
                 continue;
             }
 
@@ -687,38 +753,81 @@ public:
             // builds an ideal look-at pose, so it is strictly more permissive than A --
             // no reason to run it on a vertex A already accepted.
             const Eigen::Vector3d position = pose.translation();
-            if (ctx_->vis_oracle_->checkBallBeamVisibility(position, target.center, target.radius)
-                    <= ctx_->visibility_threshold_) {
+            const double position_fraction =
+                ctx_->vis_oracle_->checkBallBeamVisibility(position, target.center, target.radius);
+            if (position_fraction <= ctx_->visibility_threshold_) {
                 continue;
             }
 
+            // The event worth watching while debugging a query that covers nothing:
+            // reaching here means the end effector is somewhere a look at this target
+            // would work, and everything after this point is about whether the arm can
+            // be brought to that look.
+            ++coverage_dbg_.position_hits;
+            ROS_INFO("Coverage: vertex %ld POSITION SEES target %lu from "
+                     "(%.2f, %.2f, %.2f) - sees %.2f > %.2f; trying VisualIK.",
+                     static_cast<long>(v), t, position.x(), position.y(), position.z(),
+                     position_fraction, ctx_->visibility_threshold_);
+
             Eigen::Matrix3d look_at = ctx_->sampler_->computeLookAtRotation(position, target.center);
             std::vector<double> q_snapped;
-            if (!ctx_->vis_ik_->solveVisualIK(q, target, look_at, q_snapped)) continue;
+            if (!ctx_->vis_ik_->solveVisualIK(q, target, look_at, q_snapped)) {
+                ++coverage_dbg_.ik_failures;
+                ROS_INFO("  target %lu: VisualIK found no configuration at that position.", t);
+                continue;
+            }
 
             // VisualIK chooses where to put the tool from geometry alone and never
             // consults the obstacles, and the test just above answered for THIS
             // vertex's position rather than the snapped one. Crediting without asking
             // the oracle would let the result promise a configuration that sees the
             // target while it looks at a wall.
-            if (ctx_->vis_oracle_->checkBallBeamVisibility(q_snapped, target.center, target.radius)
-                    <= ctx_->visibility_threshold_) {
+            const double snapped_fraction =
+                ctx_->vis_oracle_->checkBallBeamVisibility(q_snapped, target.center, target.radius);
+            if (snapped_fraction <= ctx_->visibility_threshold_) {
+                ++coverage_dbg_.snap_unseen;
+                ROS_INFO("  target %lu: snapped configuration sees only %.2f (needs > %.2f).",
+                         t, snapped_fraction, ctx_->visibility_threshold_);
                 continue;
             }
 
             // Restricted to the arm, VisualIK structurally cannot move the base, so this
             // holds already. It is what stands between a mistake in that restriction and
             // a silently violated constraint.
-            if (!inLocality(q_snapped)) continue;
+            if (!inLocality(q_snapped)) {
+                ++coverage_dbg_.snap_outside;
+                ROS_INFO("  target %lu: snapped configuration left the locality disk.", t);
+                continue;
+            }
 
-            if (!validateEdge(q, q_snapped)) continue;
+            if (!validateEdge(q, q_snapped)) {
+                ++coverage_dbg_.snap_edge_invalid;
+                // The base displacement is reported because it is the likeliest
+                // explanation: with no locality constraint VisualIK solves for the
+                // WHOLE group, so a snap may answer with the base somewhere else
+                // entirely, and validateEdge then has to drive it there in a straight
+                // line - through whatever is in the way.
+                const double base_shift =
+                    (ctx_->basePosition(q_snapped) - ctx_->basePosition(q)).norm();
+                ROS_INFO("  target %lu: no valid edge from the vertex to its snap "
+                         "(base moved %.2f m, joint distance %.2f).",
+                         t, base_shift, distance(q, q_snapped));
+                continue;
+            }
 
             VertexDesc g = addState(q_snapped);
             graph_.addEdge(v, g, distance(q, q_snapped));
 
             // Connected only back to v: v must itself be reachable for this goal to
             // count, so hanging the snap off it gives the two identical reachability.
-            if (creditTarget(t, g, q_snapped)) credited++;
+            if (creditTarget(t, g, q_snapped)) {
+                credited++;
+                ++coverage_dbg_.snap_credited;
+                ROS_INFO("  target %lu: SNAPPED and credited (vertex %ld sees %.2f).",
+                         t, static_cast<long>(g), snapped_fraction);
+            } else {
+                ++coverage_dbg_.credit_rejected;
+            }
         }
 
         return credited;
@@ -728,6 +837,18 @@ public:
     /// fell short on rather than only that it did.
     void logCoverageSummary(const char* tag, const ros::WallTime& start_time) const {
         double elapsed = (ros::WallTime::now() - start_time).toSec();
+
+        // Printed first, and on success too: the numbers say how the run got where it
+        // got, which is as interesting when a query barely succeeded as when it failed.
+        ROS_WARN("%s: vertices tested %ld (%ld outside the locality disk); "
+                 "already looking at a target %ld; POSITION sees a target %ld, of which "
+                 "IK failed %ld, snap unseen %ld, snap outside disk %ld, edge invalid %ld, "
+                 "credited %ld; candidates turned down as duplicates or too close %ld.",
+                 tag, coverage_dbg_.vertices_tested, coverage_dbg_.locality_skipped,
+                 coverage_dbg_.direct_hits, coverage_dbg_.position_hits,
+                 coverage_dbg_.ik_failures, coverage_dbg_.snap_unseen,
+                 coverage_dbg_.snap_outside, coverage_dbg_.snap_edge_invalid,
+                 coverage_dbg_.snap_credited, coverage_dbg_.credit_rejected);
 
         if (coverage_.complete) {
             ROS_WARN("%s: all %lu targets covered %d time(s) in %.2f seconds.",
