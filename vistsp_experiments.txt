@@ -1,0 +1,18 @@
+VisTSP Experiment Results
+=========================
+
+trials: 1, targets per trial: 3, regions file: /home/roblab22/catkin_ws/src/visual_based_planning/config/sampling_regions_double_room.yaml
+start state: vertical (group whole_robot), scene objects: 59 boxes
+Regions are drawn WITH REPETITION, so a trial may contain overlapping targets;
+those are the trials that exercise node splitting. Per-trial detail is in the CSV.
+
+Method: LocalVisTSP-global-VisRRT
+  planner VisRRT, coverage k 1, base locality 0 (global / baseline)
+  successes 0 / 1
+  time coverage: avg 0 med 0 min 0 max 0 sd 0
+  time instance: avg 0 med 0 min 0 max 0 sd 0
+  time gtsp: avg 0 med 0 min 0 max 0 sd 0
+  time expand: avg 0 med 0 min 0 max 0 sd 0
+  time total: avg 0 med 0 min 0 max 0 sd 0
+  tour cost: avg 0 med 0 min 0 max 0 sd 0
+

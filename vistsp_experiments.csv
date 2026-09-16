@@ -1,0 +1,2 @@
+method,trial,num_targets,has_overlap,success,coverage_incomplete,wall_s,coverage_s,instance_s,gtsp_s,expand_s,server_total_s,tour_cost,winning_rule,num_stops,num_waypoints,rule,rule_constructed,rule_improved
+LocalVisTSP-global-VisRRT,0,3,0,0,1,500.303,500.026,0.0586127,0,0,500.085,nan,,0,0,,,
