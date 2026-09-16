@@ -431,9 +431,38 @@ public:
         }
     }
 
+    /**
+     * @brief Pulls the current planning scene from move_group before it is read.
+     *
+     * WHY. The monitor is a SUBSCRIBER: it only ever learns about world
+     * geometry published after it connected. Anything applied to move_group
+     * before this node started -- a scene loaded ahead of the planner, or a
+     * planner restarted while the scene stayed up -- was invisible here, and
+     * the node then planned in an empty world without ever saying so. That made
+     * the bring-up order load-bearing, and getting it wrong produced plausible
+     * paths through walls rather than an error.
+     *
+     * One /get_planning_scene round trip, milliseconds against a query capped
+     * at planner/time_cap seconds, so it is not worth making conditional.
+     *
+     * MUST be called BEFORE LockedPlanningSceneRO: the request takes the
+     * scene's write lock to apply what comes back, so calling it while holding
+     * the read lock deadlocks.
+     */
+    void refreshPlanningScene() {
+        if (!psm_->requestPlanningSceneState()) {
+            // Not fatal: the monitor may still be up to date from the topic.
+            // Loud, because the alternative explanation is an empty world.
+            ROS_WARN("Could not pull the planning scene from move_group "
+                     "(/get_planning_scene). Continuing with whatever the scene "
+                     "monitor has received; if the world looks empty, that is why.");
+        }
+    }
+
     bool planCallback(visual_based_planning::PlanVisibilityPath::Request &req,
                       visual_based_planning::PlanVisibilityPath::Response &res) {
 
+        refreshPlanningScene();
         planning_scene_monitor::LockedPlanningSceneRO ls(psm_);
         std::string mode;
         if (!preparePlanner(req.planner_type, ls, mode)) {
@@ -501,6 +530,7 @@ public:
 
         loadTourConfig();
 
+        refreshPlanningScene();
         planning_scene_monitor::LockedPlanningSceneRO ls(psm_);
         std::string mode;
         if (!preparePlanner(req.planner_type, ls, mode)) {
@@ -623,6 +653,16 @@ int main(int argc, char** argv) {
     psm->startSceneMonitor();
     psm->startWorldGeometryMonitor();
     psm->startStateMonitor();
+
+    // Adopt whatever move_group already holds, rather than only what is
+    // published from now on. Without this the node starts blind to a scene that
+    // was loaded before it, which is why the bring-up order used to matter; see
+    // VisualPlanningNode::refreshPlanningScene(). Failure is expected and
+    // harmless when move_group is not up yet -- the service callbacks ask again.
+    if (!psm->requestPlanningSceneState()) {
+        ROS_WARN("No planning scene from move_group at startup. It will be "
+                 "requested again on the first service call.");
+    }
 
     VisualPlanningNode node(psm);
 
