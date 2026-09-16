@@ -74,14 +74,40 @@ to allow distrobox VMs to access ethernet socket
       Targets are defined in catkin_ws/src/visual_based_planning/config/targets.yaml
 
 
+  5.5 To run the VisTSP experiments (global_plan steps 3-4), everything in one command:
+      "roslaunch visual_based_planning vistsp_experiments_full.launch"
+      This starts MoveIt for the SIMULATED MOBILE UR5, RViz (with the target spheres
+      displayed), the double-room scene, the planner node and the experiment runner.
+      Start small the first time:
+        "roslaunch visual_based_planning vistsp_experiments_full.launch num_trials:=1 targets_per_trial:=3"
+      Results: vistsp_experiments.txt and .csv in the package directory.
+
+      It must be the MOBILE UR5 MoveIt config, not tau01: planner_config.yaml plans for
+      the group "whole_robot", which is defined only in mobile_ur_moveit_config's
+      mobile_ur5.srdf. The scene must be scene_builder's double_room_1.yaml, whose
+      shelves are the bands config/sampling_regions_double_room.yaml samples from.
+
+      Every trial starts from the SRDF group_state "vertical" (base at (0, -3, 0),
+      arm up), and the runner parks the simulated robot there first. Change it with
+      start_state:=<another group_state>.
+
+      To keep the planner node warm between runs (the debugging loop), start the stack
+      once and then re-run the runner alone:
+        "roslaunch visual_based_planning vistsp_experiments.launch launch_planner:=false num_trials:=1"
+
   6. To use simulated robot instead of real robot replace all above robot instructions with:
     6.1 Open and source two terminals
     6.2 In first terminal "roscore"
     6.3 Launch simulation in second "roslaunch tau01_moveit_config demo.launch use_gui:=true"
       gui is used to move the robot away from first position if invalid
+      For the VisTSP experiments use the mobile UR5 instead:
+        "roslaunch mobile_ur_moveit_config demo.launch use_gui:=true"
 
 
-The order matters! The scene must be loaded after the service is launched.
+The order no longer matters (since 2026-09-16): visual_planning_node pulls the planning
+scene from move_group at startup and before every request, so the scene may be loaded
+before or after the service. Loading it afterwards used to be mandatory, and forgetting
+it meant planning in an empty world with no error.
 
   7. Zed camera is set to observe the workspace and populate the parameter /target_points
     with the coordinates of the targets w.r.t. the robot's pose, which is determined by

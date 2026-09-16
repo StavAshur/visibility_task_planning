@@ -14,23 +14,64 @@
     The methods are listed in the runner's run(), not here: they set parameters
     on the node themselves, because a method is a combination of planner mode,
     coverage k and base locality rather than a single value.
+
+    WHAT THIS FILE DOES NOT START: MoveIt (robot_description, move_group,
+    /joint_states) and the environment. Either bring those up first - see
+    readme.txt - or use vistsp_experiments_full.launch, which starts the whole
+    stack in one command.
   -->
 
   <arg name="num_trials" default="20"/>
   <arg name="targets_per_trial" default="5"/>
   <!-- Fixed by default so the problem set is reproducible across invocations.
        Change it deliberately to draw a different set. -->
-  <arg name="rng_seed" default="20260909"/>
+  <arg name="rng_seed" default="12345678"/>
   <arg name="publish_markers" default="true"/>
   <!-- Empty means take the frame from the robot model, which is the planning
        frame the collision objects are expressed in. Override only if wrong. -->
   <arg name="marker_frame" default=""/>
-  <arg name="results_prefix" default="vistsp_experiments"/>
+  <!-- Absolute, so the results do not land in ~/.ros: roslaunch runs nodes
+       with that as their working directory. -->
+  <arg name="results_prefix"
+       default="$(find visual_based_planning)/vistsp_experiments"/>
+  <!-- The pillar grid, not the double room: the double room was built to make
+       single-target visibility HARD and reliably leaves a target unobservable,
+       which is a broken TSP instance rather than a hard one. Goes with
+       scene_builder's pillar_grid.yaml; the two must match. -->
   <arg name="sampling_regions_file"
-       default="$(find visual_based_planning)/config/sampling_regions_double_room.yaml"/>
+       default="$(find visual_based_planning)/config/sampling_regions_pillar_grid.yaml"/>
+  <!-- Ceiling on a sampled target's radius, which otherwise comes from the
+       region's own shape (up to 0.5 m in the pillar grid's 1 x 1 x 2 cells).
+       0.5 changes nothing today; it is here so target size can be swept. -->
+  <arg name="max_target_radius" default="0.5"/>
+
+  <!-- False starts the RUNNER ONLY, against a visual_planning_node that is
+       already up. That is the debugging loop: the node keeps its planner and
+       its scene snapshot between runs, so re-running costs nothing but the
+       experiment itself. -->
+  <arg name="launch_planner" default="true"/>
+
+  <!-- A named group_state from the SRDF. Every trial of every method starts
+       here, so the start is part of the problem rather than of the setup.
+       Empty means "use the robot's current state", which is reproducible only
+       if nothing moves the robot between runs. -->
+  <arg name="start_state" default="vertical"/>
+  <!-- Empty means take the group from the node's planner/group_name, which is
+       the one authoritative copy (config/planner_config.yaml). -->
+  <arg name="planning_group" default=""/>
+  <!-- Also move the SIMULATED robot there, so RViz and the planning scene's
+       current state agree with what is being planned from. No-op on hardware. -->
+  <arg name="park_robot" default="true"/>
+
+  <!-- The runner refuses to generate problems until the planning scene holds
+       this many objects: an empty world has no occlusion, so the experiment
+       would measure nothing while still producing numbers. -->
+  <arg name="min_scene_objects" default="1"/>
+  <arg name="scene_wait_timeout" default="120.0"/>
 
   <node name="visual_planning_node" pkg="visual_based_planning"
-        type="visual_planning_node" output="screen">
+        type="visual_planning_node" output="screen"
+        if="$(arg launch_planner)">
       <rosparam command="load"
                 file="$(find visual_based_planning)/config/planner_config.yaml"/>
   </node>
@@ -44,5 +85,11 @@
       <param name="marker_frame"          value="$(arg marker_frame)"/>
       <param name="results_prefix"        value="$(arg results_prefix)"/>
       <param name="sampling_regions_file" value="$(arg sampling_regions_file)"/>
+      <param name="max_target_radius"     value="$(arg max_target_radius)"/>
+      <param name="start_state"           value="$(arg start_state)"/>
+      <param name="planning_group"        value="$(arg planning_group)"/>
+      <param name="park_robot"            value="$(arg park_robot)"/>
+      <param name="min_scene_objects"     value="$(arg min_scene_objects)"/>
+      <param name="scene_wait_timeout"    value="$(arg scene_wait_timeout)"/>
   </node>
 </launch>

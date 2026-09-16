@@ -1,0 +1,92 @@
+<launch>
+  <!--
+    The VisTSP experiments, whole stack, one command:
+
+        roslaunch visual_based_planning vistsp_experiments_full.launch
+
+    What it starts, and why each piece is needed:
+
+      1. mobile_ur_moveit_config demo.launch - roscore, robot_description,
+         move_group, fake /joint_states and robot_state_publisher. It must be
+         THIS MoveIt config and not tau01's: config/planner_config.yaml plans
+         for the group "whole_robot", which is defined only in
+         mobile_ur_moveit_config/config/mobile_ur5.srdf.
+         Its own RViz is suppressed in favour of ours (see 2).
+      2. RViz with config/vistsp_experiments.rviz - the stock MoveIt display
+         plus a MarkerArray on the runner's target topic, so the spheres of the
+         trial being solved are visible while it runs.
+      3. scene_builder load_scene.launch - the environment. The sampling
+         regions of config/sampling_regions_double_room.yaml are the shelf bands
+         of scene_builder's double_room_1.yaml, so the two go together.
+      4. visual_planning_node + the runner, via vistsp_experiments.launch.
+
+    ORDERING. The node now pulls the scene from move_group on startup and
+    before every request, and the runner waits until the scene is populated
+    before it generates problems, so no piece depends on winning a race.
+    `scene_delay` remains because the spawner talks to MOVE_GROUP, which needs a
+    moment to come up; if it ever proves too short the runner says so and stops
+    rather than running in an empty world.
+  -->
+
+  <!-- Experiment size. Start small: one trial is a full multi-target coverage
+       query per method, each capped at planner/time_cap seconds. -->
+  <arg name="num_trials" default="20"/>
+  <arg name="targets_per_trial" default="5"/>
+  <arg name="rng_seed" default="45878752"/>
+  <arg name="results_prefix"
+       default="$(find visual_based_planning)/vistsp_experiments"/>
+  <arg name="sampling_regions_file"
+       default="$(find visual_based_planning)/config/sampling_regions_pillar_grid.yaml"/>
+  <arg name="max_target_radius" default="0.5"/>
+
+  <arg name="start_state" default="vertical"/>
+  <arg name="planning_group" default=""/>
+  <arg name="park_robot" default="true"/>
+
+  <arg name="use_rviz" default="true"/>
+  <!-- The joint_state_publisher GUI. Not needed any more to fix an invalid
+       start pose - the runner parks the robot at `start_state` - but useful
+       for looking around by hand. -->
+  <arg name="use_gui" default="false"/>
+  <arg name="scene_delay" default="10.0"/>
+  <!-- The TSP environment: a 9 x 9 interior behind a 0.8 m wall, occluded by a
+       4 x 4 grid of 2 m pillars. Must match sampling_regions_file above. -->
+  <arg name="scene_config"
+       default="$(find scene_builder)/config/pillar_grid.yaml"/>
+
+  <!-- 1. Robot + MoveIt, without its RViz. -->
+  <include file="$(find mobile_ur_moveit_config)/launch/demo.launch">
+    <arg name="use_rviz" value="false"/>
+    <arg name="use_gui"  value="$(arg use_gui)"/>
+  </include>
+
+  <!-- 2. Our RViz: the MoveIt displays plus the experiment's target spheres. -->
+  <include file="$(find mobile_ur_moveit_config)/launch/moveit_rviz.launch"
+           if="$(arg use_rviz)">
+    <arg name="rviz_config"
+         value="$(find visual_based_planning)/config/vistsp_experiments.rviz"/>
+  </include>
+
+  <!-- 3. The environment. Spawned directly rather than through
+       load_scene.launch so the delay and the scene file are settable here. -->
+  <node name="scene_spawner" pkg="scene_builder" type="obstacle_spawner.py"
+        output="screen"
+        launch-prefix="bash -c 'sleep $(arg scene_delay); $0 $@'">
+    <param name="reference_frame" value="world"/>
+    <param name="config_file"     value="$(arg scene_config)"/>
+  </node>
+
+  <!-- 4. The planner node and the runner. -->
+  <include file="$(find visual_based_planning)/launch/vistsp_experiments.launch">
+    <arg name="launch_planner"        value="true"/>
+    <arg name="num_trials"            value="$(arg num_trials)"/>
+    <arg name="targets_per_trial"     value="$(arg targets_per_trial)"/>
+    <arg name="rng_seed"              value="$(arg rng_seed)"/>
+    <arg name="results_prefix"        value="$(arg results_prefix)"/>
+    <arg name="sampling_regions_file" value="$(arg sampling_regions_file)"/>
+    <arg name="max_target_radius"     value="$(arg max_target_radius)"/>
+    <arg name="start_state"           value="$(arg start_state)"/>
+    <arg name="planning_group"        value="$(arg planning_group)"/>
+    <arg name="park_robot"            value="$(arg park_robot)"/>
+  </include>
+</launch>

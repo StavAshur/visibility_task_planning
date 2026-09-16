@@ -49,7 +49,10 @@
 #include <visualization_msgs/MarkerArray.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 #include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/robot_model/robot_model.h>
+#include <moveit/robot_state/robot_state.h>
 #include <moveit_msgs/CollisionObject.h>
+#include <sensor_msgs/JointState.h>
 #include <shape_msgs/SolidPrimitive.h>
 #include <yaml-cpp/yaml.h>
 
@@ -210,6 +213,44 @@ public:
         pnh_.param<std::string>("marker_frame", marker_frame_, std::string());
         pnh_.param<std::string>("results_prefix", results_prefix_,
                                 std::string("vistsp_experiments"));
+
+        // --- start configuration -------------------------------------------
+        // A NAMED SRDF STATE, not a list of joint values: the group is built
+        // from subgroups (mobile_base + manipulator), so a hand-written vector
+        // would silently depend on the variable order MoveIt happens to use.
+        // Resolving the name through the robot model uses the same order the
+        // node's copyJointGroupPositions() does, by construction.
+        pnh_.param<std::string>("start_state", start_state_name_,
+                                std::string("vertical"));
+        // Empty means "ask the node for the group the planner is configured
+        // with". The node loads planner_config.yaml into its own private
+        // namespace, so that is where the one authoritative value lives, and
+        // duplicating it here would let the two drift apart.
+        pnh_.param<std::string>("planning_group", planning_group_, std::string());
+        pnh_.param("park_robot", park_robot_, true);
+
+        // --- scene -----------------------------------------------------------
+        // The experiment is meaningless in an empty room: with no obstacles
+        // there is no occlusion, so every target is trivially visible. Waiting
+        // for the scene, and refusing to run without it, is what keeps a
+        // forgotten load_scene.launch from producing plausible-looking numbers.
+        pnh_.param("min_scene_objects", min_scene_objects_, 1);
+        pnh_.param("scene_wait_timeout", scene_wait_timeout_, 120.0);
+
+        // --- target size -----------------------------------------------------
+        // The radius rule below is "distance to the nearest region bound", so a
+        // region's shape alone decides how big its targets are: the 0.2 m wall
+        // bands of the double room give ~0.1, the 1 x 1 x 2 cells of the pillar
+        // grid give up to 0.5. This is the ceiling on that. The default is 0.5,
+        // which changes nothing for either environment - it exists so target size
+        // can be turned into an experimental variable without reshaping regions.
+        pnh_.param("max_target_radius", max_target_radius_, 0.5);
+        if (max_target_radius_ <= 0.0) {
+            ROS_FATAL("~max_target_radius is %.3f; it must be positive. A zero or "
+                      "negative cap rejects every sphere and the run would report "
+                      "'no targets' rather than a bad setting.", max_target_radius_);
+            throw std::runtime_error("max_target_radius must be positive");
+        }
         // A FIXED default seed so a problem set is reproducible: the whole
         // point of pre-generating is that every method sees the same problems,
         // and that should hold across invocations too, not just within one.
@@ -224,13 +265,32 @@ public:
             marker_pub_ = pnh_.advertise<visualization_msgs::MarkerArray>(
                 "vistsp_targets", 1, /*latch=*/true);
         }
+        if (park_robot_) {
+            // The topic demo.launch's joint_state_publisher merges into
+            // /joint_states (its source_list). Publishing here moves the
+            // SIMULATED robot; on hardware nothing subscribes and parking is
+            // skipped with a warning.
+            park_pub_ = nh_.advertise<sensor_msgs::JointState>(
+                "/move_group/fake_controller_joint_states", 1);
+        }
     }
 
     void run() {
         ROS_INFO("Waiting for plan_visibility_tour...");
         tour_client_.waitForExistence();
 
+        // The robot model is loaded ONCE and shared: the marker frame and the
+        // start configuration both come from it, and two loads could disagree
+        // if robot_description were reloaded in between.
+        if (!loadRobotModel()) return;
+        if (!resolveStartState()) return;
+        parkRobot();
+
         if (!loadRegions()) return;
+        // Before the scene is read, not after: obstacles decide which sampled
+        // targets are rejected, so problems generated against an empty world
+        // would not be the problems the planner then solves.
+        if (!waitForScene()) return;
         loadObstacles();
         if (!generateProblems()) return;
 
@@ -247,14 +307,14 @@ public:
             c.base_locality = 0.0;   // the whole environment: the baseline
             configs.push_back(c);
 
-            c.name = "LocalVisTSP-global-VisPRM";
-            c.planner_mode = "VisPRM";
-            configs.push_back(c);
+            // c.name = "LocalVisTSP-global-VisPRM";
+            // c.planner_mode = "VisPRM";
+            // configs.push_back(c);
 
-            c.name = "LocalVisTSP-global-VisRRT-k3";
-            c.planner_mode = "VisRRT";
-            c.coverage = 3;          // more choices per target for the tour
-            configs.push_back(c);
+            // c.name = "LocalVisTSP-global-VisRRT-k3";
+            // c.planner_mode = "VisRRT";
+            // c.coverage = 3;          // more choices per target for the tour
+            // configs.push_back(c);
         }
 
         std::vector<std::string> names;
@@ -304,31 +364,222 @@ private:
         return true;
     }
 
-    /// Scene obstacles as AABBs, so a sampled target can be rejected if it is
-    /// buried in one. Same approach as the old runner.
-    void loadObstacles() {
-        moveit::planning_interface::PlanningSceneInterface psi;
+    /**
+     * @brief Loads robot_description once, for the marker frame and the start state.
+     *
+     * @return false when the model will not load. That is fatal rather than a
+     *         warning: without it neither the markers nor the start
+     *         configuration can be placed, and running anyway would produce an
+     *         experiment whose start is whatever the robot happened to be doing.
+     */
+    bool loadRobotModel() {
+        robot_model_loader::RobotModelLoader loader("robot_description");
+        robot_model_ = loader.getModel();
+        if (!robot_model_) {
+            ROS_FATAL("Could not load 'robot_description'. Is MoveIt running? "
+                      "The experiments need mobile_ur_moveit_config demo.launch "
+                      "(or the robot's bring-up) started first.");
+            return false;
+        }
         if (marker_frame_.empty()) {
             // No frame convention exists anywhere in this repo, so ask the
             // robot model rather than hardcoding one that happens to work on
             // one robot. The model frame IS the planning frame, and it is what
-            // the collision objects read below are expressed in.
+            // the collision objects are expressed in.
             // (PlanningSceneInterface has no getPlanningFrame() in Melodic.)
-            robot_model_loader::RobotModelLoader loader("robot_description");
-            if (loader.getModel()) {
-                marker_frame_ = loader.getModel()->getModelFrame();
-                ROS_INFO("Marker frame taken from the robot model: '%s'.",
-                         marker_frame_.c_str());
-            } else {
-                // Refuse to guess: markers in the wrong frame would put the
-                // targets somewhere else entirely and quietly misrepresent the
-                // problem being solved.
-                ROS_ERROR("Could not load 'robot_description' to determine the "
-                          "marker frame. Set the ~marker_frame parameter, or "
-                          "set ~publish_markers false.");
-                publish_markers_ = false;
-            }
+            marker_frame_ = robot_model_->getModelFrame();
+            ROS_INFO("Marker frame taken from the robot model: '%s'.",
+                     marker_frame_.c_str());
         }
+        return true;
+    }
+
+    /**
+     * @brief Resolves the planning group the start state belongs to.
+     *
+     * Order: the ~planning_group parameter, then the node's own
+     * planner/group_name. The node is the authority -- it is the process that
+     * actually plans -- so its value is preferred over a default repeated here.
+     *
+     * @return false when neither is set, which is a refusal rather than a guess:
+     *         a wrong group would resolve "vertical" against the wrong joints.
+     */
+    bool resolvePlanningGroup() {
+        if (!planning_group_.empty()) return true;
+        if (nh_.getParam("/visual_planning_node/planner/group_name", planning_group_)
+            && !planning_group_.empty()) {
+            ROS_INFO("Planning group taken from the node: '%s'.",
+                     planning_group_.c_str());
+            return true;
+        }
+        ROS_FATAL("No planning group: the node's "
+                  "/visual_planning_node/planner/group_name is unset and no "
+                  "~planning_group was given. Refusing to guess which joints "
+                  "'%s' names.", start_state_name_.c_str());
+        return false;
+    }
+
+    /**
+     * @brief Resolves ~start_state into the joint vector EVERY trial starts from.
+     *
+     * WHY A FIXED START. The tour is a cycle through the start configuration,
+     * so the start is part of the problem, not of the setup. Leaving it at
+     * "whatever the robot is doing" makes two runs of the same seed
+     * incomparable, which would defeat the pre-generated problem set.
+     *
+     * The name is looked up among the group's SRDF group_states. An unknown
+     * name is FATAL and lists what exists -- falling back to the current state
+     * would hide a typo behind numbers that still look reasonable.
+     *
+     * An explicitly empty ~start_state keeps the old behaviour (the node uses
+     * the robot's current state) and says so loudly.
+     *
+     * @return false when the run must not proceed.
+     */
+    bool resolveStartState() {
+        if (start_state_name_.empty()) {
+            ROS_WARN("~start_state is empty: every trial starts from the robot's "
+                     "CURRENT state, whatever it is when the trial runs. Two runs "
+                     "of the same seed are then only comparable if nothing moved "
+                     "the robot in between.");
+            return true;                       // start_joints_ stays empty
+        }
+        if (!resolvePlanningGroup()) return false;
+
+        const moveit::core::JointModelGroup* jmg =
+            robot_model_->getJointModelGroup(planning_group_);
+        if (!jmg) {
+            ROS_FATAL("Group '%s' does not exist in the robot model.",
+                      planning_group_.c_str());
+            return false;
+        }
+
+        moveit::core::RobotState state(robot_model_);
+        state.setToDefaultValues();
+        if (!state.setToDefaultValues(jmg, start_state_name_)) {
+            std::string known;
+            const std::vector<std::string>& names = jmg->getDefaultStateNames();
+            for (size_t i = 0; i < names.size(); ++i) {
+                known += (i ? ", " : "") + names[i];
+            }
+            ROS_FATAL("Group '%s' has no state named '%s'. Known states: [%s]. "
+                      "Refusing to run: falling back to the current state would "
+                      "quietly change what the experiment measures.",
+                      planning_group_.c_str(), start_state_name_.c_str(),
+                      known.c_str());
+            return false;
+        }
+        state.update();
+        state.copyJointGroupPositions(jmg, start_joints_);
+        // Same order as the positions above, which is what makes the parking
+        // message below consistent with what is sent to the planner.
+        park_joint_names_ = jmg->getVariableNames();
+
+        std::string joints;
+        for (size_t i = 0; i < start_joints_.size(); ++i) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s%.3f", i ? ", " : "", start_joints_[i]);
+            joints += buf;
+        }
+        ROS_INFO("Start state '%s' of group '%s' resolved to [%s].",
+                 start_state_name_.c_str(), planning_group_.c_str(), joints.c_str());
+        return true;
+    }
+
+    /**
+     * @brief Moves the SIMULATED robot to the resolved start state.
+     *
+     * Cosmetic for the planner -- the start is sent explicitly with every
+     * request -- but not cosmetic for the scene: the context snapshots the
+     * planning scene on the first request, and that snapshot carries the
+     * current state, which seeds collision checking for joints outside the
+     * planning group. Parking first keeps that snapshot identical across runs.
+     *
+     * Simulation only. On hardware nothing subscribes to the fake controller
+     * topic, and a robot cannot teleport anyway, so this warns and gives up.
+     */
+    void parkRobot() {
+        if (!park_robot_ || start_joints_.empty()) return;
+
+        sensor_msgs::JointState js;
+        js.name = park_joint_names_;
+        js.position = start_joints_;
+
+        // The subscriber is another node that may still be starting, and a
+        // message published before it connects is simply lost.
+        const ros::WallTime deadline = ros::WallTime::now() + ros::WallDuration(5.0);
+        while (ros::ok() && park_pub_.getNumSubscribers() == 0 &&
+               ros::WallTime::now() < deadline) {
+            ros::Duration(0.1).sleep();
+        }
+        if (park_pub_.getNumSubscribers() == 0) {
+            ROS_WARN("Nothing subscribes to /move_group/fake_controller_joint_states, "
+                     "so the robot was NOT parked at '%s'. Harmless on hardware and "
+                     "without demo.launch: the tour requests still carry the start "
+                     "configuration explicitly.", start_state_name_.c_str());
+            return;
+        }
+        // Repeated because the joint_state_publisher merges sources on its own
+        // timer; one message can land between two of its publications.
+        for (int i = 0; i < 10 && ros::ok(); ++i) {
+            js.header.stamp = ros::Time::now();
+            park_pub_.publish(js);
+            ros::Duration(0.1).sleep();
+        }
+        ROS_INFO("Parked the simulated robot at '%s'.", start_state_name_.c_str());
+    }
+
+    /**
+     * @brief Blocks until the planning scene holds at least ~min_scene_objects.
+     *
+     * THE ORDERING THIS SOLVES. The scene has to be applied after the planner
+     * node's scene monitor is subscribed, so it cannot simply be loaded first;
+     * but the runner reads it immediately after the service appears. Waiting
+     * here removes the race in both directions, and a timeout is a refusal
+     * rather than a warning because an empty world produces an experiment with
+     * no occlusion at all -- numbers that look fine and mean nothing.
+     *
+     * @return false when the scene never arrived.
+     */
+    bool waitForScene() {
+        if (min_scene_objects_ <= 0) {
+            ROS_WARN("~min_scene_objects <= 0: not waiting for a scene. The "
+                     "experiment will run in whatever world is loaded, including "
+                     "an empty one.");
+            return true;
+        }
+        moveit::planning_interface::PlanningSceneInterface psi;
+        const ros::WallTime deadline =
+            ros::WallTime::now() + ros::WallDuration(scene_wait_timeout_);
+        ros::WallTime next_log = ros::WallTime::now();
+        while (ros::ok()) {
+            const std::vector<std::string> known = psi.getKnownObjectNames();
+            if (static_cast<int>(known.size()) >= min_scene_objects_) {
+                ROS_INFO("Planning scene holds %lu objects.", known.size());
+                return true;
+            }
+            if (ros::WallTime::now() > deadline) {
+                ROS_FATAL("Waited %.0f s and the planning scene still holds %lu "
+                          "objects (< %d). Load the environment -- e.g. "
+                          "'roslaunch scene_builder load_scene.launch' -- and note "
+                          "it must be applied AFTER visual_planning_node starts.",
+                          scene_wait_timeout_, known.size(), min_scene_objects_);
+                return false;
+            }
+            if (ros::WallTime::now() >= next_log) {
+                ROS_INFO("Waiting for the planning scene (%lu/%d objects)...",
+                         known.size(), min_scene_objects_);
+                next_log = ros::WallTime::now() + ros::WallDuration(5.0);
+            }
+            ros::Duration(0.5).sleep();
+        }
+        return false;
+    }
+
+    /// Scene obstacles as AABBs, so a sampled target can be rejected if it is
+    /// buried in one. Same approach as the old runner.
+    void loadObstacles() {
+        moveit::planning_interface::PlanningSceneInterface psi;
         std::map<std::string, moveit_msgs::CollisionObject> objects = psi.getObjects();
         for (const auto& kv : objects) {
             const auto& obj = kv.second;
@@ -376,6 +627,10 @@ private:
             t.radius = std::min(std::min(std::min(t.cx - reg.min_x, reg.max_x - t.cx),
                                          std::min(t.cy - reg.min_y, reg.max_y - t.cy)),
                                 std::min(t.cz - reg.min_z, reg.max_z - t.cz));
+            // Capped AFTER the bounds rule, never instead of it: the bounds are
+            // what keeps a sphere inside the band it was drawn from, and the cap
+            // only makes it smaller.
+            t.radius = std::min(t.radius, max_target_radius_);
             if (t.radius <= 0.0) continue;
 
             bool hit = false;
@@ -447,6 +702,21 @@ private:
      * screen. Latched, so RViz picks them up whenever it subscribes.
      */
     void publishTargets(const TourProblem& prob) {
+        // Printed even when markers are off, and printed HERE rather than at
+        // generation time, so the log lists exactly what was drawn for the trial
+        // being solved. The planner prints the same three numbers per target from
+        // beginCoverageRun(); if the two lists differ, what is on screen is not the
+        // problem being solved. Indices are shared with the marker labels and with
+        // the tour response's stop_target.
+        ROS_INFO("Trial %d targets (frame %s)%s:", prob.id,
+                 marker_frame_.empty() ? "<unset>" : marker_frame_.c_str(),
+                 prob.has_overlap ? ", CONTAINS OVERLAPPING TARGETS" : "");
+        for (size_t i = 0; i < prob.targets.size(); ++i) {
+            const TargetSphere& t = prob.targets[i];
+            ROS_INFO("  target %lu: center (%.4f, %.4f, %.4f), radius %.4f  [region %d]",
+                     i, t.cx, t.cy, t.cz, t.radius, t.region_id);
+        }
+
         if (!publish_markers_) return;
 
         visualization_msgs::MarkerArray array;
@@ -544,8 +814,11 @@ private:
             t.radius   = prob.targets[i].radius;
             srv.request.targets.push_back(t);
         }
-        // start_joints left empty: the node then uses the robot's current
-        // state, which is the same for every method on a static scene.
+        // The resolved start state, so every method and every trial starts
+        // from the identical configuration. Left empty only when ~start_state
+        // was explicitly cleared, in which case the node falls back to the
+        // robot's current state.
+        srv.request.start_joints = start_joints_;
 
         const ros::WallTime t0 = ros::WallTime::now();
         out.call_ok = tour_client_.call(srv);
@@ -694,6 +967,11 @@ private:
         f << "trials: " << problems_.size()
           << ", targets per trial: " << targets_per_trial_
           << ", regions file: " << regions_file_ << "\n";
+        f << "max target radius: " << max_target_radius_ << " m\n";
+        f << "start state: "
+          << (start_joints_.empty() ? std::string("<robot's current state>")
+                                    : start_state_name_ + " (group " + planning_group_ + ")")
+          << ", scene objects: " << obstacles_.size() << " boxes\n";
         f << "Regions are drawn WITH REPETITION, so a trial may contain "
              "overlapping targets;\nthose are the trials that exercise node "
              "splitting. Per-trial detail is in the CSV.\n\n";
@@ -774,6 +1052,7 @@ private:
     ros::NodeHandle pnh_;
     ros::ServiceClient tour_client_;
     ros::Publisher marker_pub_;
+    ros::Publisher park_pub_;
     std::mt19937 rng_;
 
     int num_trials_ = 20;
@@ -782,6 +1061,18 @@ private:
     std::string regions_file_;
     std::string marker_frame_;
     std::string results_prefix_;
+
+    robot_model::RobotModelPtr robot_model_;
+    std::string start_state_name_;
+    std::string planning_group_;
+    /// Empty only when ~start_state was cleared: then the node uses the
+    /// robot's current state, as it did before this was configurable.
+    std::vector<double> start_joints_;
+    std::vector<std::string> park_joint_names_;
+    bool park_robot_ = true;
+    int min_scene_objects_ = 1;
+    double scene_wait_timeout_ = 120.0;
+    double max_target_radius_ = 0.5;
 
     std::vector<AABB> regions_;
     std::vector<AABB> obstacles_;

@@ -1,6 +1,20 @@
 PROJECT MAP
 ===========
-Last updated: 2026-09-09 (step-3 design fully settled -- O3 resolved as D6:
+Last updated: 2026-09-16 (EXPERIMENT BRING-UP. The package is now BUILT
+              (devel/ holds PlanVisibilityTour.h and vistsp_experiment_runner),
+              though the VisTSP pipeline still has not been executed. This
+              revision is about everything around the run rather than the
+              algorithms: the experiments target the SIMULATED MOBILE UR5
+              (mobile_ur_moveit_config, the only config defining the
+              "whole_robot" group) in scene_builder's double_room_1; the runner
+              now resolves an SRDF group_state ("vertical") as the start of
+              every trial, parks the simulated robot there, and refuses to
+              generate problems until the planning scene is populated; the node
+              pulls the scene from move_group instead of only listening for it,
+              which retires the "load the scene after the planner" rule from
+              readme.txt; and launch/vistsp_experiments_full.launch starts the
+              whole stack, RViz included, in one command.
+              Previous entry, 2026-09-09: step-3 design fully settled -- O3 resolved as D6:
               RP1's independence condition became an enumeration bound,
               s_min = 3, with no runtime guard; 6.1's non-adjacent duplicate
               copies accepted as-is; only O1/O2 remain open; D7 adds a
@@ -12,9 +26,7 @@ Last updated: 2026-09-09 (step-3 design fully settled -- O3 resolved as D6:
               (splitting + expansion), planners/LocalVisTSP.h (step 4, the
               composition), the plan_visibility_tour service + tour client, and
               src/vistsp_experiment_runner.cpp. ALL SYNTAX-CHECKED, NONE EVER
-              RUN -- catkin build has not been run either, so the new message
-              headers do not exist in devel/ yet. Next session: build, run an
-              experiment, expect to debug.)
+              RUN.)
 
 PURPOSE OF THIS FILE
 --------------------
@@ -103,6 +115,7 @@ DIRECTORY TREE
                                  and plan + this map
     config/                      YAML parameters (planner_config.yaml,
                                  targets.yaml, vistsp_targets.yaml, ...)
+                                 plus vistsp_experiments.rviz (RViz layout)
     include/visual_based_planning/
         planners/    PlanningContext.h  VisibilityPlannerBase.h
                      VisRRTPlanner.h  VisPRMPlanner.h  PlannerFactory.h
@@ -117,6 +130,7 @@ DIRECTORY TREE
     launch/                      visual_planner.launch  visual_ik_client.launch
                                  visual_planning_tour.launch
                                  vistsp_experiments.launch
+                                 vistsp_experiments_full.launch
     msg/                         VisibilityTask.msg  VisibilityTarget.msg
     srv/                         PlanVisibilityPath.srv  PlanVisibilityTour.srv
                                  VisualIK.srv
@@ -218,6 +232,37 @@ config/targets.yaml
   Contents: `target_points:` list of [x,y,z]; most entries commented out.
     Installed to the package share dir by CMake.
 
+config/sampling_regions_pillar_grid.yaml  (NEW 2026-09-16)
+  Role: Target sampling regions for the TSP environment, scene_builder's
+    pillar_grid.yaml. THE DEFAULT for the VisTSP experiments since 2026-09-16.
+  Significance: The double-room regions were replaced for this because that
+    environment was built to make SINGLE-TARGET visibility hard and reliably
+    leaves at least one target unobservable - a broken TSP instance rather than
+    a hard one (Stav, 2026-09-16). Here every target is observable and the
+    difficulty is the ORDER of visits.
+  Contents: 33 regions. 8 PERIMETER, tiling the 0.3 m ring of bare floor between
+    the wall's outer face (+-4.7) and the floor edge (+-5.0), z 0 to 0.8: four
+    corner blocks and four edge bands, meeting exactly. They are 0.3 m wide, not
+    the ~1 x 1 originally asked for, because that strip IS 0.3 m wide - widening
+    them needs an 11 x 11 floor or an 8 x 8 interior. The base can never drive
+    there (0.5 m base, 0.8 m wall), so those targets are always seen from inside,
+    over the wall. Plus 25 INTERIOR cells, 1.0 x 1.0 x 2.0 centred on
+    x, y in {-4, -2, 0, 2, 4}: with the 16 pillars on the odd coordinates they
+    complete the 9 x 9 interior (5 + 4 = 9 along either axis), and the 40 cells
+    with mixed parity are the corridors the base drives through.
+  Checked when written: no region intersects any obstacle in pillar_grid.yaml, so
+    none of them is silently dead - sampleTarget() rejects a sphere that hits an
+    obstacle and simply redraws, so a region buried in one would never say why it
+    produced nothing.
+
+config/vistsp_experiments.rviz  (NEW 2026-09-16)
+  Role: RViz layout for the experiments - mobile_ur_moveit_config's moveit.rviz
+    plus a rviz/MarkerArray display on
+    /vistsp_experiment_runner/vistsp_targets, and a camera pulled back to frame
+    the ~9 m room.
+  Significance: The runner has always published the trial's target spheres;
+    nothing displayed them. Used by vistsp_experiments_full.launch.
+
 config/sampling_regions.yaml
   Role: AABB regions from which experiment_runner draws random target spheres --
     the general/cluttered environment.
@@ -293,10 +338,41 @@ src/vistsp_experiment_runner.cpp  (~800 lines, NEW 2026-09-09)
   Gotcha: the marker frame comes from the ROBOT MODEL
     (RobotModelLoader::getModel()->getModelFrame()), which is the planning
     frame the collision objects are expressed in. PlanningSceneInterface has NO
-    getPlanningFrame() in Melodic -- assuming it did was a compile error. If the
-    model cannot be loaded the runner DISABLES markers rather than guessing a
-    frame, since markers in the wrong frame would put the targets somewhere
-    else and misrepresent the problem.
+    getPlanningFrame() in Melodic -- assuming it did was a compile error. Since
+    2026-09-16 the model is loaded ONCE by loadRobotModel() and shared with the
+    start-state resolution, and failing to load it is now FATAL rather than
+    just disabling markers: without the model there is no start configuration
+    either.
+  START CONFIGURATION (2026-09-16, Stav's request). run() is now
+    waitForExistence -> loadRobotModel -> resolveStartState -> parkRobot ->
+    loadRegions -> waitForScene -> loadObstacles -> generateProblems.
+    - resolveStartState() turns ~start_state (default "vertical") into the joint
+      vector sent as PlanVisibilityTour's start_joints on EVERY trial of EVERY
+      method. A NAMED SRDF group_state, never a vector in YAML: "whole_robot" is
+      built from subgroups, so a hand-written list would depend on MoveIt's
+      variable order. Resolving it through RobotState::setToDefaultValues +
+      copyJointGroupPositions uses the same order the node's applyStartJoints()
+      does, by construction. An unknown name is FATAL and lists the known states
+      (fail-loud: falling back to the current state would still produce numbers).
+      An explicitly empty ~start_state keeps the old "use the robot's current
+      state" behaviour and warns that it is not reproducible.
+    - The group comes from ~planning_group, else from the NODE's
+      /visual_planning_node/planner/group_name, so planner_config.yaml stays the
+      single authority; neither set is a refusal, not a default.
+    - parkRobot() publishes that state to /move_group/fake_controller_joint_states
+      (demo.launch's joint_state_publisher source_list), so RViz and the scene's
+      current state agree with what is planned from. Simulation only; with no
+      subscriber it warns and continues, because the request carries the start
+      explicitly anyway. Not purely cosmetic: ValidityChecker works on the
+      scene's current state, which the context snapshots on the first request.
+    - waitForScene() blocks until the scene holds ~min_scene_objects objects
+      (default 1, ~scene_wait_timeout default 120 s) and REFUSES to run
+      otherwise. An empty world has no occlusion, so every target is trivially
+      visible: the experiment would still produce a full results file. It runs
+      BEFORE generateProblems() because obstacles decide which sampled targets
+      are rejected.
+    - The results header now records the start state and the obstacle count, so
+      a results file says which world and which start produced it.
   Output: <results_prefix>.txt (human readable, per-phase timing and cost) and
     .csv (one row per method/trial/rule, including has_overlap -- plot from
     this one).
@@ -381,6 +457,55 @@ launch/visual_planner.launch
 launch/visual_ik_client.launch
   Role: Sets ~targets_yaml to config/targets.yaml and starts visual_ik_client.
     Legacy IK-only demo path.
+
+launch/vistsp_experiments.launch
+  Role: The VisTSP experiment harness - visual_planning_node plus
+    src/vistsp_experiment_runner.cpp, with every runner parameter as an arg.
+  Significance: Starts the PLANNER and the RUNNER only. It does NOT start
+    MoveIt or the environment; see vistsp_experiments_full.launch for those.
+  Contents, beyond the problem-set args (num_trials, targets_per_trial,
+    rng_seed, sampling_regions_file, results_prefix, markers):
+    - launch_planner (default true). False starts the RUNNER ALONE against an
+      already-running node. That is the debugging loop: the node keeps its
+      planner and its scene snapshot between runs, so a re-run costs only the
+      experiment itself.
+    - start_state (default "vertical"), planning_group (default empty = take
+      the node's planner/group_name), park_robot (default true).
+    - min_scene_objects / scene_wait_timeout: how long the runner waits for a
+      populated planning scene before refusing to run.
+    - max_target_radius (default 0.5): ceiling on a sampled target's radius,
+      which otherwise follows from the region's shape alone. Inert at 0.5 for
+      both environments; it exists so target size can be swept without
+      reshaping regions. Stav asked for the knob with a no-op default.
+    - results_prefix now defaults to an ABSOLUTE path inside the package;
+      roslaunch runs nodes with ~/.ros as their working directory, so the
+      previous relative default wrote the results there.
+
+NOTE - THE SCENE LIVES OUTSIDE THIS REPO: scene_builder/config/pillar_grid.yaml
+  (a 10 x 10 floor with its top 0.05 below z=0; a 0.8 m, 0.2 m thick wall around
+  a 9 x 9 interior; 16 pillars 1 x 1 x 2.0 at x, y in {-3, -1, 1, 3}). It is the
+  other half of config/sampling_regions_pillar_grid.yaml and the two must change
+  together. scene_builder is not under git, so that file has no history.
+
+launch/vistsp_experiments_full.launch  (NEW 2026-09-16)
+  Role: The whole experiment stack in one command: MoveIt (the simulated mobile
+    UR5), RViz with the experiment layout, the environment, the planner node and
+    the runner.
+  Significance: The answer to "what else do I need to start". Encodes the two
+    non-obvious bring-up facts: the MoveIt config must be
+    mobile_ur_moveit_config (config/planner_config.yaml plans for the group
+    "whole_robot", which only mobile_ur5.srdf defines), and the scene must be
+    scene_builder's double_room_1.yaml, whose shelf bands are what
+    config/sampling_regions_double_room.yaml samples from.
+  Contents: includes mobile_ur_moveit_config/demo.launch with use_rviz false,
+    then moveit_rviz.launch with config/vistsp_experiments.rviz, then
+    scene_builder's obstacle_spawner.py behind a `scene_delay` (default 10 s,
+    because the spawner talks to move_group, which needs a moment), then
+    vistsp_experiments.launch for the node and the runner.
+  Note: ordering is no longer load-bearing - the node pulls the scene itself
+    (refreshPlanningScene) and the runner waits for it (waitForScene) - so a
+    too-short scene_delay is reported and stops the run instead of silently
+    producing an experiment in an empty world.
 
 
 --- include/visual_based_planning/ ------------------------------------------
@@ -495,6 +620,32 @@ planners/VisibilityPlannerBase.h  (~700 lines)
     - Forwarding setters so callers configure a planner through one object.
       setUseVisibilityIntegrity() also sets the context's structure flag, so
       guidance can never be on while the structure it queries was never built.
+    - COVERAGE DEBUGGING (2026-09-16, added while debugging a query that covered
+      nothing). struct CoverageDebug / coverage_dbg_, reset by beginCoverageRun
+      and reported by logCoverageSummary on EVERY run, success included. Every
+      rejection in recordVisibleTargets was a bare `continue`, so from outside
+      "no vertex was ever positioned to see a target" and "every snap failed IK"
+      were indistinguishable. Counted: vertices_tested, locality_skipped,
+      direct_hits (A: the configuration already looks at a target),
+      position_hits (B: the POSITION sees one, so a snap is tried), ik_failures,
+      snap_unseen, snap_outside, snap_edge_invalid, snap_credited,
+      credit_rejected. Each event also logs one line at INFO; position_hits is
+      the one Stav asked for by name, being the moment the end effector is
+      somewhere a look at the target would work.
+    - beginCoverageRun() PRINTS EVERY TARGET (index, centre, radius, planning
+      frame) since 2026-09-16, and the runner prints the same three numbers per
+      target as it publishes the markers. The pair is a cross-check that what is
+      on screen is the problem being solved; the index is the one the deficit
+      reports, the marker labels and the tour's stop_target all use.
+    - target_mes_ IS NOT PART OF THE COVERAGE QUERY. Every reader is in plan()
+      (VisRRTPlanner 51/111/131-152, VisPRMPlanner 94/220) or the no-target
+      sampleVisibilityGoal() overload. tourCallback still calls
+      computeTargetMES() so a later plan() cannot inherit a stale ball, which is
+      why a tour logs a "Target MES" line with a large radius; the message now
+      says so, because that radius looks alarming and means nothing there.
+    - min_goal_separation_ is DORMANT: it defaults to 0.0 and nothing sets it -
+      no parameter, no caller. creditTarget now says when it turns a candidate
+      down for it, so switching it on cannot silently starve a target.
 
 planners/VisRRTPlanner.h  (~270 lines)
   Role: Visibility RRT. Maps onto Alg. vis:rrt in claude_context/4_Method.tex.
@@ -504,10 +655,20 @@ planners/VisRRTPlanner.h  (~270 lines)
     POSITION into a target-facing CONFIGURATION. Wall-clock capped by time_cap_.
     snap_fov_on_insert_ (ctor arg, default true) gates the snap; with it off the
     algorithm degrades to a plain RRT that only succeeds on direct visibility.
-    planCoverage() -- the same search asked the multi-target question: the
-    goal-biased draw aims at one target still short of coverage, every new node
-    goes through recordVisibleTargets, and the tree keeps growing until ALL
-    targets are satisfied. isReachable() is overridden to `true`: the tree is
+    planCoverage() -- the same search asked the multi-target question: every new
+    node goes through recordVisibleTargets, and the tree keeps growing until ALL
+    targets are satisfied.
+    NO GOAL BIAS SINCE 2026-09-16 (Stav's call: "that doesn't work well in my
+    opinion"). The draw that aimed at one unsatisfied target and asked the
+    VI-tree for a position seeing it (pickUnsatisfiedTarget +
+    sampleVisibilityGoal) is gone from planCoverage; sampling is now uniform
+    only. Two consequences worth knowing: (1) NOTHING in this query picks a
+    target any more - targets are never chased one at a time, and every inserted
+    node is tested against every target still short of coverage; (2) the VI-tree
+    no longer steers VisRRT coverage AT ALL, so with
+    use_visibility_integrity true the query pays for building it and uses it
+    only for beginCoverageRun's unseeable-target warning. plan(), which serves
+    the paper's single-target query, KEEPS its goal bias. isReachable() is overridden to `true`: the tree is
     rooted at root_id_ and every vertex is attached to one already in it, so the
     base class's per-goal BFS would rediscover a structural guarantee.
   NOTE (2026-08-30): plan()'s snap now VERIFIES with the oracle that the snapped
@@ -1017,6 +1178,18 @@ src/visual_planning_node.cpp
       use_visual_ik -> snap_fov_on_insert): ROS reports nothing for a parameter
       nobody reads, so the run would silently take the new default and, for this
       one, benchmark the wrong algorithm.
+    - refreshPlanningScene() (NEW 2026-09-16): calls
+      psm_->requestPlanningSceneState() at startup and at the top of BOTH
+      service callbacks. The monitor is a SUBSCRIBER, so it only ever learned
+      about geometry published after it connected; a scene loaded before the
+      node started was invisible and the node then planned in an empty world
+      without saying so. That is what made readme.txt's "the scene must be
+      loaded AFTER the service is launched" load-bearing -- and getting it wrong
+      produced paths through walls rather than an error. MUST be called BEFORE
+      taking LockedPlanningSceneRO: the request takes the scene's write lock, so
+      calling it while holding the read lock deadlocks. One /get_planning_scene
+      round trip against a query capped at planner/time_cap seconds, so it is
+      unconditional rather than a knob.
     - rebuildPlanner(scene, mode): builds the planner named by mode on the
       existing context and attachScene()s it. Cheap -- no VI-tree rebuild.
       Returns false on an unknown mode; the constructor treats that as fatal and

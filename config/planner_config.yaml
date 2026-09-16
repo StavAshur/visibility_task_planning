@@ -6,9 +6,9 @@ planner:
   # The same while scanning vertices the roadmap already held (VisPRM coverage queries
   # only). Expensive on a large persistent roadmap, so off unless asked for.
   snap_fov_on_scan: false
-  use_visibility_integrity: false
+  use_visibility_integrity: true
   use_visibility_roadmap: false
-  time_cap: 120 #seconds
+  time_cap: 500 #seconds
 
   # Planning Group & Links
   # group_name: "manipulator"
