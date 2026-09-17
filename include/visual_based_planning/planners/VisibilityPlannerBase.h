@@ -144,6 +144,21 @@ protected:
     /// visibility alone.
     bool snap_fov_on_insert_;
 
+    /// Whether VisualIK is restricted to the arm - the base held still - while a
+    /// coverage query snaps a vertex into a target-facing configuration.
+    ///
+    /// Default FALSE, which is the behaviour every result so far was produced with:
+    /// unconstrained, VisualIK solves for the whole group and may answer with the
+    /// base somewhere else entirely. That is worth a switch because branch B of
+    /// recordVisibleTargets() tests a POSITION and then asks for a configuration at
+    /// it; if IK relocates the base, the position that passed the test is not the
+    /// position of the answer, and the edge from the vertex to its snap has to drive
+    /// the base across the environment - which is what validateEdge then refuses.
+    ///
+    /// A locality constraint already pins the base for its own reason, so this only
+    /// ever ADDS the restriction; see ikGroupForRun().
+    bool fix_base_on_ik_;
+
     /// The same, while scanning vertices the graph ALREADY held -- VisPRM, at the start
     /// of a coverage query. Off by default: a persistent roadmap holds thousands of
     /// vertices placed to answer other queries, making them both the least likely to be
@@ -177,6 +192,7 @@ public:
           use_visibility_integrity_(true),
           time_cap_(120),
           snap_fov_on_insert_(true),
+          fix_base_on_ik_(false),
           snap_fov_on_scan_(false),
           root_id_(-1),
           checked_vertices_(),
@@ -225,6 +241,8 @@ public:
 
     void setSnapFovOnInsert(bool use) { snap_fov_on_insert_ = use; }
     bool getSnapFovOnInsert() const { return snap_fov_on_insert_; }
+    void setFixBaseOnIK(bool fix) { fix_base_on_ik_ = fix; }
+    bool getFixBaseOnIK() const { return fix_base_on_ik_; }
     void setSnapFovOnScan(bool use) { snap_fov_on_scan_ = use; }
     bool getSnapFovOnScan() const { return snap_fov_on_scan_; }
 
@@ -872,6 +890,20 @@ public:
      * Uniform over the UNSATISFIED targets, so effort rebalances by itself as targets
      * drop out of the pool.
      */
+    /**
+     * @brief The group VisualIK is restricted to for this run, or empty for no
+     *        restriction.
+     *
+     * ONE place decides it, because two planners ask and the two must not drift:
+     * the base is held still when a locality disk requires it (a solution outside
+     * the disk would not answer the question asked) OR when fix_base_on_ik_ asks
+     * for it independently. Empty means "leave VisualIK as it is", which
+     * IKGroupGuard treats as no change.
+     */
+    std::string ikGroupForRun() const {
+        return (locality_.enabled || fix_base_on_ik_) ? locality_.ik_group : std::string();
+    }
+
     int pickUnsatisfiedTarget() {
         std::vector<int> unsatisfied;
         unsatisfied.reserve(targets_.size());

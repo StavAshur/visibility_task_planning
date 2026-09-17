@@ -1,0 +1,110 @@
+<launch>
+  <!--
+    ONE VisTSP run, planned, drawn and executed on the simulated robot:
+
+        roslaunch visual_based_planning vistsp_single_run.launch
+
+    The single-run counterpart of vistsp_experiments_full.launch. Same stack -
+    MoveIt for the simulated mobile UR5, RViz, the environment, the planner node -
+    but it runs visual_planning_tour_client once instead of the experiment runner,
+    and the robot then drives the tour.
+
+    THE TARGETS ARE THE EXPERIMENT'S TARGETS. They are drawn by the same sampler
+    the experiment runner uses (common/RunSetup.h), from the same regions, so with
+    a given rng_seed and num_targets this run is exactly trial 0 of an experiment
+    run with that seed. Change the seed to get a different problem; set
+    targets_yaml instead to re-run one specific problem by hand.
+
+    Watching it: the targets appear as orange numbered spheres as soon as they are
+    drawn, before the planner starts; the tour appears as a cyan line through the
+    flashlight's path with a labelled marker at every stop; then the robot moves.
+  -->
+
+  <arg name="num_targets" default="5"/>
+  <!-- Change deliberately: the same seed gives the same targets every time. -->
+  <arg name="rng_seed" default="20260909"/>
+  <arg name="max_target_radius" default="0.5"/>
+  <arg name="sampling_regions_file"
+       default="$(find visual_based_planning)/config/sampling_regions_pillar_grid.yaml"/>
+  <arg name="scene_config"
+       default="$(find scene_builder)/config/pillar_grid.yaml"/>
+  <!-- Set this to re-run fixed targets from a file; it REPLACES the random draw,
+       and setting both is refused rather than silently resolved. -->
+  <arg name="targets_yaml" default=""/>
+
+  <!-- How the tour is solved. These are the node's parameters, not the client's:
+       an unset service field would arrive as false and silently disable an
+       algorithm, so they stay parameters. -->
+  <arg name="planner_type" default=""/>
+  <arg name="coverage" default="1"/>
+  <arg name="base_locality" default="0.0"/>
+  <arg name="two_opt" default="true"/>
+  <arg name="nearest" default="true"/>
+  <arg name="farthest" default="true"/>
+  <arg name="cheapest" default="true"/>
+  <arg name="fix_base_on_ik" default="false"/>
+
+  <arg name="start_state" default="vertical"/>
+  <arg name="execute" default="true"/>
+  <arg name="draw_tour" default="true"/>
+  <arg name="velocity_scaling" default="1.0"/>
+  <arg name="acceleration_scaling" default="1.0"/>
+
+  <arg name="use_rviz" default="true"/>
+  <arg name="use_gui" default="false"/>
+  <arg name="scene_delay" default="10.0"/>
+
+  <!-- 1. Robot + MoveIt, without its own RViz. -->
+  <include file="$(find mobile_ur_moveit_config)/launch/demo.launch">
+    <arg name="use_rviz" value="false"/>
+    <arg name="use_gui"  value="$(arg use_gui)"/>
+  </include>
+
+  <!-- 2. RViz with the targets, the tour and the executing robot. -->
+  <include file="$(find mobile_ur_moveit_config)/launch/moveit_rviz.launch"
+           if="$(arg use_rviz)">
+    <arg name="rviz_config"
+         value="$(find visual_based_planning)/config/vistsp_experiments.rviz"/>
+  </include>
+
+  <!-- 3. The environment. -->
+  <node name="scene_spawner" pkg="scene_builder" type="obstacle_spawner.py"
+        output="screen"
+        launch-prefix="bash -c 'sleep $(arg scene_delay); $0 $@'">
+    <param name="reference_frame" value="world"/>
+    <param name="config_file"     value="$(arg scene_config)"/>
+  </node>
+
+  <!-- 4. The planner. -->
+  <node name="visual_planning_node" pkg="visual_based_planning"
+        type="visual_planning_node" output="screen">
+      <rosparam command="load"
+                file="$(find visual_based_planning)/config/planner_config.yaml"/>
+      <!-- Loaded after the YAML so these win over the file's values. -->
+      <param name="planner/fix_base_on_ik"                value="$(arg fix_base_on_ik)"/>
+      <param name="planner/vistsp/base_locality_radius"   value="$(arg base_locality)"/>
+      <param name="planner/vistsp/coverage"               value="$(arg coverage)"/>
+      <param name="planner/vistsp/use_two_opt"            value="$(arg two_opt)"/>
+      <param name="planner/vistsp/use_nearest_insertion"  value="$(arg nearest)"/>
+      <param name="planner/vistsp/use_farthest_insertion" value="$(arg farthest)"/>
+      <param name="planner/vistsp/use_cheapest_insertion" value="$(arg cheapest)"/>
+  </node>
+
+  <!-- 5. The run itself. -->
+  <node name="visual_planning_tour_client" pkg="visual_based_planning"
+        type="visual_planning_tour_client" output="screen">
+      <param name="sampling_regions_file" value="$(arg sampling_regions_file)"
+             unless="$(eval targets_yaml != '')"/>
+      <param name="targets_yaml"          value="$(arg targets_yaml)"
+             if="$(eval targets_yaml != '')"/>
+      <param name="num_targets"        value="$(arg num_targets)"/>
+      <param name="rng_seed"           value="$(arg rng_seed)"/>
+      <param name="max_target_radius"  value="$(arg max_target_radius)"/>
+      <param name="planner_type"       value="$(arg planner_type)"/>
+      <param name="start_state"        value="$(arg start_state)"/>
+      <param name="execute"            value="$(arg execute)"/>
+      <param name="draw_tour"          value="$(arg draw_tour)"/>
+      <param name="velocity_scaling"     value="$(arg velocity_scaling)"/>
+      <param name="acceleration_scaling" value="$(arg acceleration_scaling)"/>
+  </node>
+</launch>

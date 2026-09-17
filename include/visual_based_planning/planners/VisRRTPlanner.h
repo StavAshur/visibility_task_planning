@@ -202,8 +202,7 @@ public:
         // Restricted to the arm, VisualIK cannot move the base, so a snapped
         // configuration inherits the base of the node it snapped from -- already inside
         // the disk. Restored when this scope ends, whichever way it ends.
-        IKGroupGuard ik_guard(ctx_->getVisualIK(),
-                              locality_.enabled ? locality_.ik_group : std::string());
+        IKGroupGuard ik_guard(ctx_->getVisualIK(), ikGroupForRun());
 
         root_id_ = addState(start_joint_values_);
         recordVisibleTargets(root_id_, start_joint_values_,

@@ -36,6 +36,7 @@ private:
     bool planner_dirty_;
     bool snap_fov_on_insert_;
     bool snap_fov_on_scan_;
+    bool fix_base_on_ik_ = false;
     bool use_visibility_integrity_;
     bool use_visibility_roadmap_;
     bool current_shortcutting_;
@@ -156,6 +157,9 @@ public:
         // Retained; applied at planner construction.
         pnh_.param("planner/snap_fov_on_insert", snap_fov_on_insert_, true);
         pnh_.param("planner/snap_fov_on_scan", snap_fov_on_scan_, false);
+        // Construction-time, like the snap flags: it is passed to the planner when
+        // one is built, so changing it takes effect on the next planner rebuild.
+        pnh_.param("planner/fix_base_on_ik", fix_base_on_ik_, false);
 
         std::string group_name;
         // pnh_.param<std::string>("planner/group_name", group_name, "manipulator");
@@ -249,6 +253,7 @@ public:
         visual_planner::PlannerOptions opts;
         opts.snap_fov_on_insert = snap_fov_on_insert_;
         opts.snap_fov_on_scan = snap_fov_on_scan_;
+        opts.fix_base_on_ik = fix_base_on_ik_;
         opts.use_visibility_integrity = use_visibility_integrity_;
         opts.shortcutting = current_shortcutting_;
         opts.time_cap = time_cap_;

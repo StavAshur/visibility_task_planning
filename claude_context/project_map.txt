@@ -1,6 +1,16 @@
 PROJECT MAP
 ===========
-Last updated: 2026-09-16 (EXPERIMENT BRING-UP. The package is now BUILT
+Last updated: 2026-09-17 (SINGLE RUN, EXECUTED. The pipeline now works: the
+              first successful VisTSP results are committed (7a7ab0d), all three
+              methods succeeding on the pillar grid. This revision adds the
+              single-run path - common/RunSetup.h shares the target draw and the
+              start state between the experiment runner and the tour client, so a
+              watched run IS trial 0 of a benchmark with the same seed; the tour
+              client now samples, draws the targets and the tour, parks the robot
+              and EXECUTES through PathExecuter; launch/vistsp_single_run.launch
+              starts the whole stack for one run. Also planner/fix_base_on_ik
+              (default false), which holds the base still while VisualIK snaps.
+              Previous entry, 2026-09-16: EXPERIMENT BRING-UP. The package is now BUILT
               (devel/ holds PlanVisibilityTour.h and vistsp_experiment_runner),
               though the VisTSP pipeline still has not been executed. This
               revision is about everything around the run rather than the
@@ -343,6 +353,12 @@ src/vistsp_experiment_runner.cpp  (~800 lines, NEW 2026-09-09)
     start-state resolution, and failing to load it is now FATAL rather than
     just disabling markers: without the model there is no start configuration
     either.
+  DELEGATES TO common/RunSetup.h since 2026-09-17: the region load, the scene
+    read and wait, the draw, the start state, the parking and the markers all
+    moved there so the tour client performs them identically. The runner keeps its
+    trial structure, its statistics and its reporting - what moved is only the
+    setup, and the RNG order is unchanged, so an old seed still reproduces its old
+    problem set.
   START CONFIGURATION (2026-09-16, Stav's request). run() is now
     waitForExistence -> loadRobotModel -> resolveStartState -> parkRobot ->
     loadRegions -> waitForScene -> loadObstacles -> generateProblems.
@@ -380,10 +396,33 @@ src/vistsp_experiment_runner.cpp  (~800 lines, NEW 2026-09-09)
     invocations, not just within one run.
   Status: written and syntax-checked; NOT yet run.
 
-src/visual_planning_tour_client.cpp  (~250 lines, NEW 2026-09-09)
-  Role: Client for the plan_visibility_tour service. Reads targets from the
-    YAML named by its `targets_yaml` param, calls the service, and prints the
-    per-algorithm cost table.
+src/visual_planning_tour_client.cpp  (~520 lines, NEW 2026-09-09,
+                                      execution + sampling 2026-09-17)
+  Role: ONE VisTSP run: get the targets, call the service, print the cost table,
+    draw the targets and the tour, and RUN IT ON THE ROBOT.
+  Significance: the single-run counterpart of the experiment runner. The runner
+    answers "how do these methods compare over many problems" and executes
+    nothing; this answers "what does one run look like" and executes it.
+  TARGETS COME FROM EXACTLY ONE OF: ~sampling_regions_file (a random draw, with
+    ~num_targets/~rng_seed/~max_target_radius, through common/RunSetup.h's
+    TargetSampler - so a given seed reproduces the experiment's trial 0), or
+    ~targets_yaml (fixed targets, three shapes, below). Both set, or neither, is
+    REFUSED: a launch file that sets both means one of them is not doing what its
+    author thinks.
+  EXECUTION: ~execute (default true) runs the returned trajectory through
+    PathExecuter on the group the NODE planned for, the same component the
+    single-target client uses; ~velocity_scaling / ~acceleration_scaling throttle
+    it. The robot is parked at ~start_state (default "vertical") first, so
+    execution starts where the tour was planned from instead of jumping there. An
+    AsyncSpinner runs before PathExecuter is built, since MoveGroupInterface waits
+    on callbacks.
+  DRAWING: the targets go out before the service call, so they are on screen while
+    the coverage query runs; drawTour() then publishes the END EFFECTOR's path
+    through the whole trajectory as a LINE_STRIP plus a labelled marker per stop
+    ("stop 2 -> target 0"), the tour being a configuration-space cycle that cannot
+    be drawn directly. Decoration, so every failure in it warns and returns.
+    Topics ~vistsp_targets and ~vistsp_tour, both latched, both displayed by
+    config/vistsp_experiments.rviz.
   Significance: THE PLACE CLOUD-TO-SPHERE CONVERSION HAPPENS. See the target
     representation note below.
   Accepts three YAML shapes, in this order: `targets` (spheres with an explicit
@@ -487,6 +526,16 @@ NOTE - THE SCENE LIVES OUTSIDE THIS REPO: scene_builder/config/pillar_grid.yaml
   other half of config/sampling_regions_pillar_grid.yaml and the two must change
   together. scene_builder is not under git, so that file has no history.
 
+launch/vistsp_single_run.launch  (NEW 2026-09-17)
+  Role: One run, planned, drawn and executed - the whole stack in one command.
+  Significance: the demo path. Same pieces as vistsp_experiments_full.launch, with
+    the tour client in place of the runner, and the robot then drives the tour.
+  Contents: num_targets / rng_seed / max_target_radius / sampling_regions_file
+    (or targets_yaml, which replaces the draw); the node's own vistsp knobs
+    (planner_type, coverage, base_locality, the three insertion rules, two_opt)
+    and fix_base_on_ik, all loaded AFTER planner_config.yaml so they win; and
+    start_state, execute, draw_tour, velocity_scaling, acceleration_scaling.
+
 launch/vistsp_experiments_full.launch  (NEW 2026-09-16)
   Role: The whole experiment stack in one command: MoveIt (the simulated mobile
     UR5), RViz with the experiment layout, the environment, the planner node and
@@ -509,6 +558,28 @@ launch/vistsp_experiments_full.launch  (NEW 2026-09-16)
 
 
 --- include/visual_based_planning/ ------------------------------------------
+
+common/RunSetup.h  (~460 lines, NEW 2026-09-17)
+  Role: Everything a VisTSP run needs set up before it can be planned: sampling
+    regions, scene obstacles, the target draw, the named start state, parking the
+    simulated robot, and the target markers.
+  Significance: THE ONE DEFINITION OF "HOW A TARGET IS DRAWN", shared by
+    src/vistsp_experiment_runner.cpp and src/visual_planning_tour_client.cpp.
+    Not reuse for its own sake: TargetSampler owns the random engine and consumes
+    it in a fixed order (region, x, y, z, repeat), so the same regions, seed and
+    count give the tour client EXACTLY the experiment's trial 0. A single run
+    being watched is then a member of the distribution being benchmarked rather
+    than a lookalike. Two copies would drift and nobody would notice.
+  Contents: AABB, TargetSphere, sphereIntersectsAABB; loadRegions,
+    collectSceneObstacles, waitForSceneObjects (refuses an empty world, which
+    would otherwise produce a full and meaningless result); class TargetSampler
+    (the draw, plus anyOverlap); loadRobotModel, resolvePlanningGroup (prefers the
+    NODE's planner/group_name over a client-side default), resolveNamedStartState
+    (an SRDF group_state, fatal if unknown), parkSimulatedRobot (publishes to
+    /move_group/fake_controller_joint_states; simulation only, never
+    load-bearing); logTargets and targetMarkers.
+  Nothing here knows about planners or tours: it is the boundary between "what
+    problem are we solving" and "how do we solve it".
 
 common/Types.h
   Role: Shared POD types and every default parameter value.
@@ -643,6 +714,28 @@ planners/VisibilityPlannerBase.h  (~700 lines)
       computeTargetMES() so a later plan() cannot inherit a stale ball, which is
       why a tour logs a "Target MES" line with a large radius; the message now
       says so, because that radius looks alarming and means nothing there.
+    - fix_base_on_ik_ (NEW 2026-09-17, planner/fix_base_on_ik, default FALSE):
+      holds the BASE still while VisualIK snaps, by restricting it to
+      locality_.ik_group. ikGroupForRun() is the ONE place that decides the
+      restriction - base locality already requires it, and this flag adds it
+      independently - so the two planners cannot drift apart. Default false keeps
+      every result so far reproducible; true is the fix for the "edge invalid"
+      losses in the coverage tally, where an unconstrained snap answered with the
+      base somewhere else and validateEdge had to cross the environment to reach
+      it. Construction-time, so it takes effect on the next planner rebuild.
+    - VisPRM's ROADMAP PERSISTS ACROSS QUERIES, by decision (Stav, 2026-09-17:
+      "I want PRM's graph to persist"). planCoverage() does not call reset() while
+      VisRRT's does, and the node only resets on a parameter change, so in a
+      multi-trial experiment VisPRM's trial N inherits the roadmap of trials
+      1..N-1 while VisRRT starts fresh every time. Deliberate - a PRM is a
+      multi-query planner - but it means their per-trial timings are not directly
+      comparable, and VisPRM's coverage times should be expected to fall as a run
+      proceeds. Say so when reporting those numbers.
+    - DEFERRED (Stav, 2026-09-17): with VisRRT's goal bias gone, the VI-tree no
+      longer steers the coverage query at all - it is built, and used only for
+      beginCoverageRun()'s unseeable-target warning. He wants to watch the tree
+      being built in RViz before deciding what to do about it, "not now". Raise it
+      when the next RViz session on the tree comes up.
     - min_goal_separation_ is DORMANT: it defaults to 0.0 and nothing sets it -
       no parameter, no caller. creditTarget now says when it turns a candidate
       down for it, so switching it on cannot silently starve a target.

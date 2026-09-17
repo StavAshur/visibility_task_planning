@@ -24,6 +24,8 @@ struct PlannerOptions {
     /// The same while scanning vertices the graph already held (VisPRM coverage only).
     bool snap_fov_on_scan = false;
     bool use_visibility_integrity = true; ///< Draw goal samples from the visibility structure.
+    /// Hold the base still while VisualIK snaps, even without a locality disk.
+    bool fix_base_on_ik = false;
     bool shortcutting = true;
     int time_cap = 120;
     RRTParams rrt;
@@ -59,6 +61,7 @@ inline std::unique_ptr<VisibilityPlannerBase> createPlanner(
 
     planner->setSnapFovOnInsert(opts.snap_fov_on_insert);
     planner->setSnapFovOnScan(opts.snap_fov_on_scan);
+    planner->setFixBaseOnIK(opts.fix_base_on_ik);
     planner->setShortcutting(opts.shortcutting);
     planner->setTimeCap(opts.time_cap);
     planner->setRRTParams(opts.rrt);

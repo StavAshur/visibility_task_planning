@@ -62,12 +62,14 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "visual_based_planning/PlanVisibilityTour.h"
+#include "visual_based_planning/common/RunSetup.h"
 
 namespace {
 
@@ -75,17 +77,11 @@ namespace {
 // Problem description -- deliberately says nothing about how it will be solved
 // ---------------------------------------------------------------------------
 
-struct AABB {
-    double min_x, max_x;
-    double min_y, max_y;
-    double min_z, max_z;
-};
-
-struct TargetSphere {
-    double cx, cy, cz;
-    double radius;
-    int region_id = -1;   ///< which sampling region it came from
-};
+// Region boxes, target balls, the draw itself, the scene read, the start state
+// and the markers all live in common/RunSetup.h, shared with the tour client so a
+// single watched run and a batch draw from the same distribution - see the header.
+using visual_planner::run_setup::AABB;
+using visual_planner::run_setup::TargetSphere;
 
 /// One trial: a set of targets to be toured. Generated once, solved by every
 /// method under test.
@@ -180,19 +176,6 @@ Stats computeStats(const std::vector<double>& data) {
     return s;
 }
 
-/// Squared-distance test, as in the old runner.
-bool sphereIntersectsAABB(double cx, double cy, double cz, double r,
-                          const AABB& box) {
-    double sq = 0.0;
-    if (cx < box.min_x) sq += (box.min_x - cx) * (box.min_x - cx);
-    if (cx > box.max_x) sq += (cx - box.max_x) * (cx - box.max_x);
-    if (cy < box.min_y) sq += (box.min_y - cy) * (box.min_y - cy);
-    if (cy > box.max_y) sq += (cy - box.max_y) * (cy - box.max_y);
-    if (cz < box.min_z) sq += (box.min_z - cz) * (box.min_z - cz);
-    if (cz > box.max_z) sq += (cz - box.max_z) * (cz - box.max_z);
-    return sq <= r * r;
-}
-
 } // namespace
 
 
@@ -255,23 +238,13 @@ public:
         // point of pre-generating is that every method sees the same problems,
         // and that should hold across invocations too, not just within one.
         // Change it deliberately to get a different problem set.
-        int seed = 0;
-        pnh_.param("rng_seed", seed, 20260909);
-        rng_ = std::mt19937(static_cast<unsigned>(seed));
+        pnh_.param("rng_seed", rng_seed_, 20260909);
         ROS_INFO("VisTSP experiments: %d trials x %d targets, seed %d.",
-                 num_trials_, targets_per_trial_, seed);
+                 num_trials_, targets_per_trial_, rng_seed_);
 
         if (publish_markers_) {
             marker_pub_ = pnh_.advertise<visualization_msgs::MarkerArray>(
                 "vistsp_targets", 1, /*latch=*/true);
-        }
-        if (park_robot_) {
-            // The topic demo.launch's joint_state_publisher merges into
-            // /joint_states (its source_list). Publishing here moves the
-            // SIMULATED robot; on hardware nothing subscribes and parking is
-            // skipped with a warning.
-            park_pub_ = nh_.advertise<sensor_msgs::JointState>(
-                "/move_group/fake_controller_joint_states", 1);
         }
     }
 
@@ -307,14 +280,14 @@ public:
             c.base_locality = 0.0;   // the whole environment: the baseline
             configs.push_back(c);
 
-            // c.name = "LocalVisTSP-global-VisPRM";
-            // c.planner_mode = "VisPRM";
-            // configs.push_back(c);
+            c.name = "LocalVisTSP-global-VisPRM";
+            c.planner_mode = "VisPRM";
+            configs.push_back(c);
 
-            // c.name = "LocalVisTSP-global-VisRRT-k3";
-            // c.planner_mode = "VisRRT";
-            // c.coverage = 3;          // more choices per target for the tour
-            // configs.push_back(c);
+            c.name = "LocalVisTSP-global-VisRRT-k3";
+            c.planner_mode = "VisRRT";
+            c.coverage = 3;          // more choices per target for the tour
+            configs.push_back(c);
         }
 
         std::vector<std::string> names;
@@ -339,29 +312,7 @@ private:
     // -----------------------------------------------------------------------
 
     bool loadRegions() {
-        try {
-            YAML::Node config = YAML::LoadFile(regions_file_);
-            for (const auto& node : config["sampling_regions"]) {
-                AABB r;
-                r.min_x = node["min"][0].as<double>();
-                r.min_y = node["min"][1].as<double>();
-                r.min_z = node["min"][2].as<double>();
-                r.max_x = node["max"][0].as<double>();
-                r.max_y = node["max"][1].as<double>();
-                r.max_z = node["max"][2].as<double>();
-                regions_.push_back(r);
-            }
-        } catch (const std::exception& e) {
-            ROS_ERROR("Failed to load sampling regions from '%s': %s",
-                      regions_file_.c_str(), e.what());
-            return false;
-        }
-        if (regions_.empty()) {
-            ROS_ERROR("No sampling regions in '%s'.", regions_file_.c_str());
-            return false;
-        }
-        ROS_INFO("Loaded %lu sampling regions.", regions_.size());
-        return true;
+        return visual_planner::run_setup::loadRegions(regions_file_, regions_);
     }
 
     /**
@@ -373,20 +324,13 @@ private:
      *         experiment whose start is whatever the robot happened to be doing.
      */
     bool loadRobotModel() {
-        robot_model_loader::RobotModelLoader loader("robot_description");
-        robot_model_ = loader.getModel();
-        if (!robot_model_) {
-            ROS_FATAL("Could not load 'robot_description'. Is MoveIt running? "
-                      "The experiments need mobile_ur_moveit_config demo.launch "
-                      "(or the robot's bring-up) started first.");
-            return false;
-        }
+        robot_model_ = visual_planner::run_setup::loadRobotModel();
+        if (!robot_model_) return false;
         if (marker_frame_.empty()) {
-            // No frame convention exists anywhere in this repo, so ask the
-            // robot model rather than hardcoding one that happens to work on
-            // one robot. The model frame IS the planning frame, and it is what
-            // the collision objects are expressed in.
-            // (PlanningSceneInterface has no getPlanningFrame() in Melodic.)
+            // The model frame IS the planning frame the collision objects are
+            // expressed in, so markers drawn in it land where the planner thinks
+            // the targets are. No frame convention exists anywhere in this repo to
+            // hardcode instead.
             marker_frame_ = robot_model_->getModelFrame();
             ROS_INFO("Marker frame taken from the robot model: '%s'.",
                      marker_frame_.c_str());
@@ -405,18 +349,7 @@ private:
      *         a wrong group would resolve "vertical" against the wrong joints.
      */
     bool resolvePlanningGroup() {
-        if (!planning_group_.empty()) return true;
-        if (nh_.getParam("/visual_planning_node/planner/group_name", planning_group_)
-            && !planning_group_.empty()) {
-            ROS_INFO("Planning group taken from the node: '%s'.",
-                     planning_group_.c_str());
-            return true;
-        }
-        ROS_FATAL("No planning group: the node's "
-                  "/visual_planning_node/planner/group_name is unset and no "
-                  "~planning_group was given. Refusing to guess which joints "
-                  "'%s' names.", start_state_name_.c_str());
-        return false;
+        return visual_planner::run_setup::resolvePlanningGroup(nh_, planning_group_);
     }
 
     /**
@@ -439,51 +372,15 @@ private:
     bool resolveStartState() {
         if (start_state_name_.empty()) {
             ROS_WARN("~start_state is empty: every trial starts from the robot's "
-                     "CURRENT state, whatever it is when the trial runs. Two runs "
-                     "of the same seed are then only comparable if nothing moved "
-                     "the robot in between.");
+                     "CURRENT state, whatever it is when the trial runs. Two runs of "
+                     "the same seed are then only comparable if nothing moved the "
+                     "robot in between.");
             return true;                       // start_joints_ stays empty
         }
         if (!resolvePlanningGroup()) return false;
-
-        const moveit::core::JointModelGroup* jmg =
-            robot_model_->getJointModelGroup(planning_group_);
-        if (!jmg) {
-            ROS_FATAL("Group '%s' does not exist in the robot model.",
-                      planning_group_.c_str());
-            return false;
-        }
-
-        moveit::core::RobotState state(robot_model_);
-        state.setToDefaultValues();
-        if (!state.setToDefaultValues(jmg, start_state_name_)) {
-            std::string known;
-            const std::vector<std::string>& names = jmg->getDefaultStateNames();
-            for (size_t i = 0; i < names.size(); ++i) {
-                known += (i ? ", " : "") + names[i];
-            }
-            ROS_FATAL("Group '%s' has no state named '%s'. Known states: [%s]. "
-                      "Refusing to run: falling back to the current state would "
-                      "quietly change what the experiment measures.",
-                      planning_group_.c_str(), start_state_name_.c_str(),
-                      known.c_str());
-            return false;
-        }
-        state.update();
-        state.copyJointGroupPositions(jmg, start_joints_);
-        // Same order as the positions above, which is what makes the parking
-        // message below consistent with what is sent to the planner.
-        park_joint_names_ = jmg->getVariableNames();
-
-        std::string joints;
-        for (size_t i = 0; i < start_joints_.size(); ++i) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "%s%.3f", i ? ", " : "", start_joints_[i]);
-            joints += buf;
-        }
-        ROS_INFO("Start state '%s' of group '%s' resolved to [%s].",
-                 start_state_name_.c_str(), planning_group_.c_str(), joints.c_str());
-        return true;
+        return visual_planner::run_setup::resolveNamedStartState(
+            robot_model_, planning_group_, start_state_name_,
+            start_joints_, park_joint_names_);
     }
 
     /**
@@ -499,34 +396,9 @@ private:
      * topic, and a robot cannot teleport anyway, so this warns and gives up.
      */
     void parkRobot() {
-        if (!park_robot_ || start_joints_.empty()) return;
-
-        sensor_msgs::JointState js;
-        js.name = park_joint_names_;
-        js.position = start_joints_;
-
-        // The subscriber is another node that may still be starting, and a
-        // message published before it connects is simply lost.
-        const ros::WallTime deadline = ros::WallTime::now() + ros::WallDuration(5.0);
-        while (ros::ok() && park_pub_.getNumSubscribers() == 0 &&
-               ros::WallTime::now() < deadline) {
-            ros::Duration(0.1).sleep();
-        }
-        if (park_pub_.getNumSubscribers() == 0) {
-            ROS_WARN("Nothing subscribes to /move_group/fake_controller_joint_states, "
-                     "so the robot was NOT parked at '%s'. Harmless on hardware and "
-                     "without demo.launch: the tour requests still carry the start "
-                     "configuration explicitly.", start_state_name_.c_str());
-            return;
-        }
-        // Repeated because the joint_state_publisher merges sources on its own
-        // timer; one message can land between two of its publications.
-        for (int i = 0; i < 10 && ros::ok(); ++i) {
-            js.header.stamp = ros::Time::now();
-            park_pub_.publish(js);
-            ros::Duration(0.1).sleep();
-        }
-        ROS_INFO("Parked the simulated robot at '%s'.", start_state_name_.c_str());
+        if (!park_robot_) return;
+        visual_planner::run_setup::parkSimulatedRobot(
+            nh_, park_joint_names_, start_joints_, start_state_name_);
     }
 
     /**
@@ -542,63 +414,19 @@ private:
      * @return false when the scene never arrived.
      */
     bool waitForScene() {
-        if (min_scene_objects_ <= 0) {
-            ROS_WARN("~min_scene_objects <= 0: not waiting for a scene. The "
-                     "experiment will run in whatever world is loaded, including "
-                     "an empty one.");
-            return true;
-        }
-        moveit::planning_interface::PlanningSceneInterface psi;
-        const ros::WallTime deadline =
-            ros::WallTime::now() + ros::WallDuration(scene_wait_timeout_);
-        ros::WallTime next_log = ros::WallTime::now();
-        while (ros::ok()) {
-            const std::vector<std::string> known = psi.getKnownObjectNames();
-            if (static_cast<int>(known.size()) >= min_scene_objects_) {
-                ROS_INFO("Planning scene holds %lu objects.", known.size());
-                return true;
-            }
-            if (ros::WallTime::now() > deadline) {
-                ROS_FATAL("Waited %.0f s and the planning scene still holds %lu "
-                          "objects (< %d). Load the environment -- e.g. "
-                          "'roslaunch scene_builder load_scene.launch' -- and note "
-                          "it must be applied AFTER visual_planning_node starts.",
-                          scene_wait_timeout_, known.size(), min_scene_objects_);
-                return false;
-            }
-            if (ros::WallTime::now() >= next_log) {
-                ROS_INFO("Waiting for the planning scene (%lu/%d objects)...",
-                         known.size(), min_scene_objects_);
-                next_log = ros::WallTime::now() + ros::WallDuration(5.0);
-            }
-            ros::Duration(0.5).sleep();
-        }
-        return false;
+        return visual_planner::run_setup::waitForSceneObjects(min_scene_objects_,
+                                                              scene_wait_timeout_);
     }
 
     /// Scene obstacles as AABBs, so a sampled target can be rejected if it is
     /// buried in one. Same approach as the old runner.
     void loadObstacles() {
-        moveit::planning_interface::PlanningSceneInterface psi;
-        std::map<std::string, moveit_msgs::CollisionObject> objects = psi.getObjects();
-        for (const auto& kv : objects) {
-            const auto& obj = kv.second;
-            for (size_t i = 0; i < obj.primitives.size(); ++i) {
-                if (obj.primitives[i].type != shape_msgs::SolidPrimitive::BOX) continue;
-                if (i >= obj.primitive_poses.size()) continue;
-                const double dx = obj.primitives[i].dimensions[shape_msgs::SolidPrimitive::BOX_X];
-                const double dy = obj.primitives[i].dimensions[shape_msgs::SolidPrimitive::BOX_Y];
-                const double dz = obj.primitives[i].dimensions[shape_msgs::SolidPrimitive::BOX_Z];
-                const auto& p = obj.primitive_poses[i].position;
-                AABB o;
-                o.min_x = p.x - dx / 2.0; o.max_x = p.x + dx / 2.0;
-                o.min_y = p.y - dy / 2.0; o.max_y = p.y + dy / 2.0;
-                o.min_z = p.z - dz / 2.0; o.max_z = p.z + dz / 2.0;
-                obstacles_.push_back(o);
-            }
-        }
-        ROS_INFO("Extracted %lu box obstacles from the planning scene.",
-                 obstacles_.size());
+        visual_planner::run_setup::collectSceneObstacles(obstacles_);
+        // Built here, once the regions and the obstacles it draws against exist.
+        // It owns the random engine, so the draw sequence - region, x, y, z,
+        // repeat - is identical to the tour client's for the same seed.
+        sampler_.reset(new visual_planner::run_setup::TargetSampler(
+            regions_, obstacles_, static_cast<unsigned>(rng_seed_), max_target_radius_));
     }
 
     /**
@@ -611,40 +439,7 @@ private:
      * is what keeps a target inside the wall band it was sampled from.
      */
     bool sampleTarget(TargetSphere& out) {
-        std::uniform_int_distribution<int> pick(0, static_cast<int>(regions_.size()) - 1);
-        for (int attempt = 0; attempt < 1000; ++attempt) {
-            const int region_id = pick(rng_);
-            const AABB& reg = regions_[region_id];
-
-            std::uniform_real_distribution<double> dx(reg.min_x, reg.max_x);
-            std::uniform_real_distribution<double> dy(reg.min_y, reg.max_y);
-            std::uniform_real_distribution<double> dz(reg.min_z, reg.max_z);
-            TargetSphere t;
-            t.region_id = region_id;
-            t.cx = dx(rng_);
-            t.cy = dy(rng_);
-            t.cz = dz(rng_);
-            t.radius = std::min(std::min(std::min(t.cx - reg.min_x, reg.max_x - t.cx),
-                                         std::min(t.cy - reg.min_y, reg.max_y - t.cy)),
-                                std::min(t.cz - reg.min_z, reg.max_z - t.cz));
-            // Capped AFTER the bounds rule, never instead of it: the bounds are
-            // what keeps a sphere inside the band it was drawn from, and the cap
-            // only makes it smaller.
-            t.radius = std::min(t.radius, max_target_radius_);
-            if (t.radius <= 0.0) continue;
-
-            bool hit = false;
-            for (size_t o = 0; o < obstacles_.size() && !hit; ++o) {
-                if (sphereIntersectsAABB(t.cx, t.cy, t.cz, t.radius, obstacles_[o])) {
-                    hit = true;
-                }
-            }
-            if (hit) continue;
-
-            out = t;
-            return true;
-        }
-        return false;
+        return sampler_ && sampler_->sample(out);
     }
 
     bool generateProblems() {
@@ -702,62 +497,13 @@ private:
      * screen. Latched, so RViz picks them up whenever it subscribes.
      */
     void publishTargets(const TourProblem& prob) {
-        // Printed even when markers are off, and printed HERE rather than at
-        // generation time, so the log lists exactly what was drawn for the trial
-        // being solved. The planner prints the same three numbers per target from
-        // beginCoverageRun(); if the two lists differ, what is on screen is not the
-        // problem being solved. Indices are shared with the marker labels and with
-        // the tour response's stop_target.
-        ROS_INFO("Trial %d targets (frame %s)%s:", prob.id,
-                 marker_frame_.empty() ? "<unset>" : marker_frame_.c_str(),
-                 prob.has_overlap ? ", CONTAINS OVERLAPPING TARGETS" : "");
-        for (size_t i = 0; i < prob.targets.size(); ++i) {
-            const TargetSphere& t = prob.targets[i];
-            ROS_INFO("  target %lu: center (%.4f, %.4f, %.4f), radius %.4f  [region %d]",
-                     i, t.cx, t.cy, t.cz, t.radius, t.region_id);
-        }
+        char what[64];
+        snprintf(what, sizeof(what), "Trial %d", prob.id);
+        visual_planner::run_setup::logTargets(prob.targets, marker_frame_, what);
 
         if (!publish_markers_) return;
-
-        visualization_msgs::MarkerArray array;
-        // A DELETEALL first, so the previous trial's markers do not linger and
-        // get mistaken for this trial's problem.
-        visualization_msgs::Marker clear;
-        clear.header.frame_id = marker_frame_;
-        clear.header.stamp = ros::Time::now();
-        clear.action = visualization_msgs::Marker::DELETEALL;
-        array.markers.push_back(clear);
-
-        for (size_t i = 0; i < prob.targets.size(); ++i) {
-            const TargetSphere& t = prob.targets[i];
-
-            visualization_msgs::Marker m;
-            m.header.frame_id = marker_frame_;
-            m.header.stamp = ros::Time::now();
-            m.ns = "vistsp_targets";
-            m.id = static_cast<int>(i);
-            m.type = visualization_msgs::Marker::SPHERE;
-            m.action = visualization_msgs::Marker::ADD;
-            m.pose.position.x = t.cx;
-            m.pose.position.y = t.cy;
-            m.pose.position.z = t.cz;
-            m.pose.orientation.w = 1.0;
-            m.scale.x = m.scale.y = m.scale.z = 2.0 * t.radius;  // diameter
-            m.color.r = 1.0f; m.color.g = 0.55f; m.color.b = 0.0f;
-            m.color.a = 0.6f;
-            array.markers.push_back(m);
-
-            visualization_msgs::Marker label = m;
-            label.ns = "vistsp_target_labels";
-            label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-            label.pose.position.z = t.cz + t.radius + 0.05;
-            label.scale.z = 0.12;
-            label.color.r = label.color.g = label.color.b = 1.0f;
-            label.color.a = 1.0f;
-            label.text = std::to_string(i);
-            array.markers.push_back(label);
-        }
-        marker_pub_.publish(array);
+        marker_pub_.publish(
+            visual_planner::run_setup::targetMarkers(prob.targets, marker_frame_));
     }
 
     // -----------------------------------------------------------------------
@@ -1052,8 +798,11 @@ private:
     ros::NodeHandle pnh_;
     ros::ServiceClient tour_client_;
     ros::Publisher marker_pub_;
-    ros::Publisher park_pub_;
-    std::mt19937 rng_;
+    /// Draws every target of every trial. Owns the random engine, so the seed
+    /// reproduces a problem set exactly - and reproduces it in the tour client too,
+    /// which draws with the same class.
+    std::unique_ptr<visual_planner::run_setup::TargetSampler> sampler_;
+    int rng_seed_ = 20260909;
 
     int num_trials_ = 20;
     int targets_per_trial_ = 5;
