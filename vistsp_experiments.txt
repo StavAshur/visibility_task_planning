@@ -1,18 +1,38 @@
 VisTSP Experiment Results
 =========================
 
-trials: 1, targets per trial: 3, regions file: /home/roblab22/catkin_ws/src/visual_based_planning/config/sampling_regions_double_room.yaml
-start state: vertical (group whole_robot), scene objects: 59 boxes
+trials: 1, targets per trial: 3, regions file: /home/roblab22/catkin_ws/src/visual_based_planning/config/sampling_regions_pillar_grid.yaml
+start state: vertical (group whole_robot), scene objects: 21 boxes
 Regions are drawn WITH REPETITION, so a trial may contain overlapping targets;
 those are the trials that exercise node splitting. Per-trial detail is in the CSV.
 
 Method: LocalVisTSP-global-VisRRT
   planner VisRRT, coverage k 1, base locality 0 (global / baseline)
-  successes 0 / 1
-  time coverage: avg 0 med 0 min 0 max 0 sd 0
-  time instance: avg 0 med 0 min 0 max 0 sd 0
-  time gtsp: avg 0 med 0 min 0 max 0 sd 0
-  time expand: avg 0 med 0 min 0 max 0 sd 0
-  time total: avg 0 med 0 min 0 max 0 sd 0
-  tour cost: avg 0 med 0 min 0 max 0 sd 0
+  successes 1 / 1
+  time coverage: avg 10.0856 med 10.0856 min 10.0856 max 10.0856 sd 0
+  time instance: avg 0.00428736 med 0.00428736 min 0.00428736 max 0.00428736 sd 0
+  time gtsp: avg 1.0142e-05 med 1.0142e-05 min 1.0142e-05 max 1.0142e-05 sd 0
+  time expand: avg 6.37123 med 6.37123 min 6.37123 max 6.37123 sd 0
+  time total: avg 16.4611 med 16.4611 min 16.4611 max 16.4611 sd 0
+  tour cost: avg 125.349 med 125.349 min 125.349 max 125.349 sd 0
+
+Method: LocalVisTSP-global-VisPRM
+  planner VisPRM, coverage k 1, base locality 0 (global / baseline)
+  successes 1 / 1
+  time coverage: avg 25.444 med 25.444 min 25.444 max 25.444 sd 0
+  time instance: avg 0.00872822 med 0.00872822 min 0.00872822 max 0.00872822 sd 0
+  time gtsp: avg 2.524e-05 med 2.524e-05 min 2.524e-05 max 2.524e-05 sd 0
+  time expand: avg 0.682067 med 0.682067 min 0.682067 max 0.682067 sd 0
+  time total: avg 26.1349 med 26.1349 min 26.1349 max 26.1349 sd 0
+  tour cost: avg 85.9182 med 85.9182 min 85.9182 max 85.9182 sd 0
+
+Method: LocalVisTSP-global-VisRRT-k3
+  planner VisRRT, coverage k 3, base locality 0 (global / baseline)
+  successes 1 / 1
+  time coverage: avg 8.38131 med 8.38131 min 8.38131 max 8.38131 sd 0
+  time instance: avg 0.00822415 med 0.00822415 min 0.00822415 max 0.00822415 sd 0
+  time gtsp: avg 1.3177e-05 med 1.3177e-05 min 1.3177e-05 max 1.3177e-05 sd 0
+  time expand: avg 1.33465 med 1.33465 min 1.33465 max 1.33465 sd 0
+  time total: avg 9.7242 med 9.7242 min 9.7242 max 9.7242 sd 0
+  tour cost: avg 55.9609 med 55.9609 min 55.9609 max 55.9609 sd 0
 
