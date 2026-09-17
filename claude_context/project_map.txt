@@ -524,7 +524,11 @@ NOTE - THE SCENE LIVES OUTSIDE THIS REPO: scene_builder/config/pillar_grid.yaml
   (a 10 x 10 floor with its top 0.05 below z=0; a 0.8 m, 0.2 m thick wall around
   a 9 x 9 interior; 16 pillars 1 x 1 x 2.0 at x, y in {-3, -1, 1, 3}). It is the
   other half of config/sampling_regions_pillar_grid.yaml and the two must change
-  together. scene_builder is not under git, so that file has no history.
+  together. scene_builder became a LOCAL git repository on 2026-09-17 (71b40ba,
+  all eight environment YAMLs), so that file has history - but the repository has
+  NO REMOTE and Stav chose to keep it that way rather than create a second one or
+  move the environments in here. The environments are therefore backed up
+  nowhere: a lost disk loses them, and that is a decision, not an oversight.
 
 launch/vistsp_single_run.launch  (NEW 2026-09-17)
   Role: One run, planned, drawn and executed - the whole stack in one command.
